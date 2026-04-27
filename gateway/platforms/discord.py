@@ -1078,6 +1078,20 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
 
+            # ACOS-HERMES Patch 2: outbound filter (channel whitelist +
+            # defence-in-depth redaction). Disabled when
+            # DISCORD_HERMES_CHANNEL_ID is unset.
+            from gateway.platforms.discord_outbound_filter import filter_outbound
+            allowed, sanitized_content, block_reason = filter_outbound(
+                content, chat_id=chat_id, thread_id=thread_id,
+            )
+            if not allowed:
+                return SendResult(
+                    success=False,
+                    error=f"outbound filter blocked: {block_reason}",
+                )
+            content = sanitized_content
+
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))
