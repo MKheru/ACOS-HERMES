@@ -2010,18 +2010,26 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 }, ensure_ascii=False)
 
             # Collect text from content blocks
+            # ACOS-HERMES Patch 1: each block.text is sanitised against
+            # prompt-injection patterns before being concatenated.
+            from agent.mcp_sanitizer import (
+                sanitize_mcp_output,
+                sanitize_mcp_structured,
+            )
             parts: List[str] = []
             for block in (result.content or []):
                 if hasattr(block, "text"):
-                    parts.append(block.text)
+                    parts.append(sanitize_mcp_output(block.text, server_name))
             text_result = "\n".join(parts) if parts else ""
 
             # Combine content + structuredContent when both are present.
             # MCP spec: content is model-oriented (text), structuredContent
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
+            # ACOS-HERMES Patch 1: structured is also scanned.
             structured = getattr(result, "structuredContent", None)
             if structured is not None:
+                structured = sanitize_mcp_structured(structured, server_name)
                 if text_result:
                     return json.dumps({
                         "result": text_result,
