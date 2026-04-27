@@ -529,6 +529,12 @@ class SamplingHandler:
     def __init__(self, server_name: str, config: dict):
         self.server_name = server_name
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
+        # ACOS-HERMES Patch 3: daily ceiling on top of the per-minute limit.
+        # At max_rpm=10 a single server could otherwise reach ~14400 calls/day,
+        # which is far above any legitimate MCP usage and would drain the
+        # auxiliary LLM budget. Default 200 keeps headroom for chatty servers
+        # while putting a hard upper bound on damage from a runaway server.
+        self.max_rpd = _safe_numeric(config.get("max_rpd", 200), 200, int)
         self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
         self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
         self.max_tool_rounds = _safe_numeric(
@@ -544,6 +550,8 @@ class SamplingHandler:
 
         # Per-instance state
         self._rate_timestamps: List[float] = []
+        # ACOS-HERMES Patch 3: sliding-window timestamps for daily limit
+        self._daily_timestamps: List[float] = []
         self._tool_loop_count = 0
         self.metrics = {"requests": 0, "errors": 0, "tokens_used": 0, "tool_use_count": 0}
 
@@ -557,6 +565,18 @@ class SamplingHandler:
         if len(self._rate_timestamps) >= self.max_rpm:
             return False
         self._rate_timestamps.append(now)
+        return True
+
+    def _check_daily_limit(self) -> bool:
+        """ACOS-HERMES Patch 3: 24h sliding-window cap. Returns True if allowed."""
+        now = time.time()
+        day_window = now - 86400  # 24 hours
+        self._daily_timestamps[:] = [
+            t for t in self._daily_timestamps if t > day_window
+        ]
+        if len(self._daily_timestamps) >= self.max_rpd:
+            return False
+        self._daily_timestamps.append(now)
         return True
 
     # -- Model resolution ----------------------------------------------------
@@ -757,7 +777,7 @@ class SamplingHandler:
         ``CreateMessageResult``, ``CreateMessageResultWithTools``, or
         ``ErrorData``.
         """
-        # Rate limit
+        # Rate limit (per-minute, upstream)
         if not self._check_rate_limit():
             logger.warning(
                 "MCP server '%s' sampling rate limit exceeded (%d/min)",
@@ -767,6 +787,18 @@ class SamplingHandler:
             return self._error(
                 f"Sampling rate limit exceeded for server '{self.server_name}' "
                 f"({self.max_rpm} requests/minute)"
+            )
+
+        # ACOS-HERMES Patch 3: daily cap on top of per-minute cap.
+        if not self._check_daily_limit():
+            logger.warning(
+                "MCP server '%s' sampling DAILY limit exceeded (%d/24h)",
+                self.server_name, self.max_rpd,
+            )
+            self.metrics["errors"] += 1
+            return self._error(
+                f"Sampling daily limit exceeded for server '{self.server_name}' "
+                f"({self.max_rpd} requests/24h)"
             )
 
         # Resolve model

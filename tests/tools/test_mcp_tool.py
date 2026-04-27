@@ -2132,6 +2132,7 @@ class TestSamplingHandlerInit:
         h = SamplingHandler("srv", {})
         assert h.server_name == "srv"
         assert h.max_rpm == 10
+        assert h.max_rpd == 200  # ACOS-HERMES Patch 3 default
         assert h.timeout == 30
         assert h.max_tokens_cap == 4096
         assert h.max_tool_rounds == 5
@@ -2191,6 +2192,41 @@ class TestRateLimit:
         # Simulate timestamps from 61 seconds ago
         self.handler._rate_timestamps[:] = [time.time() - 61] * 3
         assert self.handler._check_rate_limit() is True
+
+
+class TestDailyLimit:
+    """ACOS-HERMES Patch 3: 24h sliding-window cap."""
+
+    def setup_method(self):
+        # max_rpd=3 for fast testing; max_rpm high enough to not interfere
+        self.handler = SamplingHandler("rd", {"max_rpm": 1000, "max_rpd": 3})
+
+    def test_allows_under_daily_limit(self):
+        assert self.handler._check_daily_limit() is True
+        assert self.handler._check_daily_limit() is True
+        assert self.handler._check_daily_limit() is True
+
+    def test_rejects_over_daily_limit(self):
+        for _ in range(3):
+            self.handler._check_daily_limit()
+        assert self.handler._check_daily_limit() is False
+
+    def test_daily_window_expiry(self):
+        """Timestamps older than 24h are purged."""
+        for _ in range(3):
+            self.handler._check_daily_limit()
+        # Simulate timestamps from 24h+1s ago
+        self.handler._daily_timestamps[:] = [time.time() - 86401] * 3
+        assert self.handler._check_daily_limit() is True
+
+    def test_custom_max_rpd(self):
+        h = SamplingHandler("c", {"max_rpd": 50})
+        assert h.max_rpd == 50
+
+    def test_string_max_rpd(self):
+        """YAML can deliver numeric values as strings."""
+        h = SamplingHandler("c", {"max_rpd": "150"})
+        assert h.max_rpd == 150
 
 
 # ---------------------------------------------------------------------------
