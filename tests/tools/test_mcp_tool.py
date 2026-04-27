@@ -1118,6 +1118,96 @@ class TestBuildSafeEnv:
         assert "API_SECRET" not in result
 
 
+class TestBuildSafeEnvAcosHermesPatch5:
+    """ACOS-HERMES Patch 5: drop sensitive-named keys from user_env unless
+    explicitly opted in via allow_sensitive_env=True."""
+
+    def test_user_env_with_api_key_dropped_by_default(self):
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            result = _build_safe_env(
+                {"MY_API_KEY": "leak", "OTHER": "ok"},
+                server_name="testsvc",
+            )
+
+        assert "MY_API_KEY" not in result
+        assert result.get("OTHER") == "ok"
+
+    def test_user_env_with_token_dropped(self):
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            result = _build_safe_env(
+                {"GITHUB_TOKEN": "ghp_x", "LANG_OVERRIDE": "fr"},
+                server_name="testsvc",
+            )
+
+        assert "GITHUB_TOKEN" not in result
+        assert result["LANG_OVERRIDE"] == "fr"
+
+    def test_user_env_with_secret_password_credential_auth_dropped(self):
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            result = _build_safe_env(
+                {
+                    "MY_SECRET": "x",
+                    "MY_PASSWORD": "y",
+                    "MY_CREDENTIAL": "z",
+                    "MY_AUTH": "w",
+                    "PASSWD_FILE": "v",
+                    "BENIGN_VAR": "ok",
+                },
+                server_name="testsvc",
+            )
+
+        for forbidden in ("MY_SECRET", "MY_PASSWORD", "MY_CREDENTIAL",
+                          "MY_AUTH", "PASSWD_FILE"):
+            assert forbidden not in result, f"{forbidden} should be dropped"
+        assert result["BENIGN_VAR"] == "ok"
+
+    def test_allow_sensitive_env_opt_in(self):
+        """When allow_sensitive_env=True, sensitive names pass through."""
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            result = _build_safe_env(
+                {"MY_API_KEY": "intentional"},
+                server_name="testsvc",
+                allow_sensitive_env=True,
+            )
+
+        assert result["MY_API_KEY"] == "intentional"
+
+    def test_case_insensitive_match(self):
+        """Pattern is case-insensitive (api_key, Api-Key, etc.)."""
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            result = _build_safe_env(
+                {"my_api_key": "x", "Api_Token": "y"},
+                server_name="testsvc",
+            )
+
+        assert "my_api_key" not in result
+        assert "Api_Token" not in result
+
+    def test_benign_user_env_passes(self):
+        """Names without sensitive substrings still pass through."""
+        from tools.mcp_tool import _build_safe_env
+
+        with patch.dict("os.environ", {"PATH": "/usr/bin"}, clear=True):
+            result = _build_safe_env(
+                {"NODE_ENV": "production", "PORT": "3000", "DEBUG": "1"},
+                server_name="testsvc",
+            )
+
+        assert result["NODE_ENV"] == "production"
+        assert result["PORT"] == "3000"
+        assert result["DEBUG"] == "1"
+
+
 # ---------------------------------------------------------------------------
 # _sanitize_error
 # ---------------------------------------------------------------------------

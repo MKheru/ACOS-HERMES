@@ -253,6 +253,15 @@ _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
 })
 
+# ACOS-HERMES Patch 5: detect sensitive variable NAMES in per-server user_env.
+# Defends against accidentally-leaked secrets in server configs (typos,
+# copy-paste from another file, third-party config snippets). Opt-out per
+# server via `allow_sensitive_env: true` in the MCP server config.
+_SENSITIVE_USER_ENV_NAME_RE = re.compile(
+    r"(API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)",
+    re.IGNORECASE,
+)
+
 # Regex for credential patterns to strip from error messages
 _CREDENTIAL_PATTERN = re.compile(
     r"(?:"
@@ -273,7 +282,11 @@ _CREDENTIAL_PATTERN = re.compile(
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+def _build_safe_env(
+    user_env: Optional[dict],
+    server_name: str = "unknown",
+    allow_sensitive_env: bool = False,
+) -> dict:
     """Build a filtered environment dict for stdio subprocesses.
 
     Only passes through safe baseline variables (PATH, HOME, etc.) and XDG_*
@@ -282,13 +295,29 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
 
     This prevents accidentally leaking secrets like API keys, tokens, or
     credentials to MCP server subprocesses.
+
+    ACOS-HERMES Patch 5: when ``allow_sensitive_env`` is False (default),
+    user_env keys whose NAMES match the sensitive-name pattern (API_KEY,
+    TOKEN, SECRET, PASSWORD, CREDENTIAL, AUTH) are dropped with a
+    warning. Opt in per-server with ``allow_sensitive_env: true`` in
+    the MCP server config when the subprocess legitimately needs that
+    variable to function.
     """
     env = {}
     for key, value in os.environ.items():
         if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
             env[key] = value
     if user_env:
-        env.update(user_env)
+        for key, value in user_env.items():
+            if not allow_sensitive_env and _SENSITIVE_USER_ENV_NAME_RE.search(key):
+                logger.warning(
+                    "MCP server '%s': dropped user_env key %r (matches "
+                    "sensitive-name pattern). If this variable is required, "
+                    "set 'allow_sensitive_env: true' on this server's config.",
+                    server_name, key,
+                )
+                continue
+            env[key] = value
     return env
 
 
@@ -1015,13 +1044,19 @@ class MCPServerTask:
         command = config.get("command")
         args = config.get("args", [])
         user_env = config.get("env")
+        # ACOS-HERMES Patch 5: per-server opt-in for sensitive env names.
+        allow_sensitive_env = bool(config.get("allow_sensitive_env", False))
 
         if not command:
             raise ValueError(
                 f"MCP server '{self.name}' has no 'command' in config"
             )
 
-        safe_env = _build_safe_env(user_env)
+        safe_env = _build_safe_env(
+            user_env,
+            server_name=self.name,
+            allow_sensitive_env=allow_sensitive_env,
+        )
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
         # Check package against OSV malware database before spawning
