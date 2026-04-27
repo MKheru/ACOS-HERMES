@@ -83,6 +83,79 @@ class TestWriteAllowed:
     def test_project_file(self):
         assert _is_write_denied("/home/user/project/main.py") is False
 
-    def test_hermes_config_not_env(self):
-        path = os.path.join(str(Path.home()), ".hermes", "config.yaml")
-        assert _is_write_denied(path) is False
+    def test_env_example_template(self):
+        # ACOS-HERMES: .env.example is a public template, not a secret
+        assert _is_write_denied("/tmp/project/.env.example") is False
+
+    def test_env_sample_template(self):
+        assert _is_write_denied("/tmp/project/.env.sample") is False
+
+
+class TestAcosHermesIdentityFiles:
+    """ACOS-HERMES Patch 4: identity files in HERMES_HOME are write-denied."""
+
+    def test_hermes_config_yaml_is_denied(self):
+        # ACOS-HERMES policy: AH must not self-modify its config.
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / "config.yaml")
+        assert _is_write_denied(path) is True
+
+    def test_hermes_cli_config_yaml_is_denied(self):
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / "cli-config.yaml")
+        assert _is_write_denied(path) is True
+
+    def test_hermes_soul_md_is_denied(self):
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / "SOUL.md")
+        assert _is_write_denied(path) is True
+
+    def test_hermes_md_is_denied(self):
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / "HERMES.md")
+        assert _is_write_denied(path) is True
+
+
+class TestAcosHermesAdditionalDeny:
+    """ACOS-HERMES Patch 4: additional shell rc and VPS env paths."""
+
+    def test_zshenv_is_denied(self):
+        # User-global env vars file containing API keys
+        path = os.path.join(str(Path.home()), ".zshenv")
+        assert _is_write_denied(path) is True
+
+    def test_etc_hermes_prefix_is_denied(self):
+        # systemd EnvironmentFile location on the ACOS Hermes VPS
+        assert _is_write_denied("/etc/hermes/env.list") is True
+
+
+class TestAcosHermesBasenameDeny:
+    """ACOS-HERMES Patch 4: basename-pattern deny (key files, env files)."""
+
+    def test_pem_anywhere_is_denied(self):
+        assert _is_write_denied("/tmp/foo.pem") is True
+
+    def test_key_anywhere_is_denied(self):
+        assert _is_write_denied("/tmp/private.key") is True
+
+    def test_p12_anywhere_is_denied(self):
+        assert _is_write_denied("/tmp/cert.p12") is True
+
+    def test_pfx_anywhere_is_denied(self):
+        assert _is_write_denied("/tmp/cert.pfx") is True
+
+    def test_ppk_anywhere_is_denied(self):
+        assert _is_write_denied("/tmp/putty.ppk") is True
+
+    def test_dotenv_anywhere_is_denied(self):
+        assert _is_write_denied("/tmp/project/.env") is True
+
+    def test_dotenv_local_is_denied(self):
+        assert _is_write_denied("/tmp/project/.env.local") is True
+
+    def test_dotenv_production_is_denied(self):
+        assert _is_write_denied("/tmp/project/.env.production") is True
+
+    def test_secrets_env_suffix_is_denied(self):
+        # Non-dotfile .env (e.g. secrets.env, prod.env)
+        assert _is_write_denied("/tmp/secrets.env") is True
