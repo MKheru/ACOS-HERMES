@@ -96,6 +96,10 @@ _PREFIX_PATTERNS = [
     r"hsk-[A-Za-z0-9]{10,}",            # Hindsight API key
     r"mem0_[A-Za-z0-9]{10,}",           # Mem0 Platform API key
     r"brv_[A-Za-z0-9]{10,}",            # ByteRover API key
+    # ACOS-specific patterns (added 2026-04-27)
+    r"jina_[A-Za-z0-9_]{20,}",          # Jina AI API key
+    r"tskey-auth-[A-Za-z0-9_-]{10,}",   # Tailscale auth key
+    r"M[A-Za-z0-9_-]{22,29}\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,40}", # Discord bot token (3-part dot-separated)
 ]
 
 # ENV assignment patterns: KEY=value where KEY contains a secret-like name

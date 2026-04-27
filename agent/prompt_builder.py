@@ -52,7 +52,7 @@ _CONTEXT_INVISIBLE_CHARS = {
 }
 
 
-def _scan_context_content(content: str, filename: str) -> str:
+def _scan_context_content(content: str, filename: str, is_policy: bool = False) -> str:
     """Scan context file content for injection. Returns sanitized content."""
     findings = []
 
@@ -63,6 +63,11 @@ def _scan_context_content(content: str, filename: str) -> str:
 
     # Check threat patterns
     for pattern, pid in _CONTEXT_THREAT_PATTERNS:
+        # Policy files (SOUL.md, HERMES.md) describe what NOT to do, so they
+        # legitimately contain literal examples of forbidden patterns. Skip the
+        # exfil/secret-read patterns for those files but keep injection ones.
+        if is_policy and pid in ("exfil_curl", "read_secrets"):
+            continue
         if re.search(pattern, content, re.IGNORECASE):
             findings.append(pid)
 
@@ -949,7 +954,7 @@ def load_soul_md() -> Optional[str]:
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
-        content = _scan_context_content(content, "SOUL.md")
+        content = _scan_context_content(content, "SOUL.md", is_policy=True)
         content = _truncate_content(content, "SOUL.md")
         return content
     except Exception as e:
@@ -972,7 +977,7 @@ def _load_hermes_md(cwd_path: Path) -> str:
             rel = str(hermes_md_path.relative_to(cwd_path))
         except ValueError:
             pass
-        content = _scan_context_content(content, rel)
+        content = _scan_context_content(content, rel, is_policy=True)
         result = f"## {rel}\n\n{content}"
         return _truncate_content(result, ".hermes.md")
     except Exception as e:
