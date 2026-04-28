@@ -8267,6 +8267,15 @@ class AIAgent:
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
+        # SMCP G2 — refuse cross-MCP tool chains unless user authorised.
+        try:
+            from agent.mcp_tool_scope import enforce_tool_scope
+            scope_denial = enforce_tool_scope(function_name, messages or [])
+        except Exception:
+            scope_denial = None
+        if scope_denial is not None:
+            return scope_denial
+
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(

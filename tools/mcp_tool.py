@@ -2515,6 +2515,13 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     safe_tool_name = sanitize_mcp_name_component(mcp_tool.name)
     safe_server_name = sanitize_mcp_name_component(server_name)
     prefixed_name = f"mcp_{safe_server_name}_{safe_tool_name}"
+    # SMCP G2 — record ownership so the tool-scope enforcer can detect
+    # cross-MCP chain attempts at dispatch time.
+    try:
+        from agent.mcp_tool_scope import register_mcp_tool
+        register_mcp_tool(prefixed_name, server_name)
+    except Exception:
+        pass  # never let bookkeeping break MCP registration
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
