@@ -801,6 +801,54 @@ class SamplingHandler:
                 f"({self.max_rpd} requests/24h)"
             )
 
+        # ACOS-HERMES Patch 10: reputation-based gate. Each MCP has a
+        # persistent reputation score modulated by past incidents. A
+        # banned / quarantined / HIGH_SUSPICION server is refused
+        # sampling regardless of rate budget. Score < 60 (HIGH_SUSPICION)
+        # disables sampling outright; score 60-80 (PROBATION) requires
+        # user authorisation (signalled by the host; default False here
+        # since SamplingHandler can't see the user trace — the agent
+        # layer should pre-set this via context or pre-validate).
+        try:
+            from agent.mcp_reputation import (
+                MCPIdentity, _get_reputation_registry,
+            )
+            registry = _get_reputation_registry()
+            mcp_uuid = f"server:{self.server_name}"
+            identity = MCPIdentity(
+                uuid=mcp_uuid,
+                name=self.server_name,
+                declared_capabilities=frozenset({"sampling"}),
+            )
+            registry.register(identity)
+            allow, reason, rep_meta = registry.evaluate_action(
+                mcp_uuid,
+                "sampling",
+                {"user_authorised": False,
+                 "requested_capability": "sampling"},
+            )
+            if not allow:
+                logger.warning(
+                    "MCP server '%s' sampling refused by reputation gate: "
+                    "%s (score=%s, band=%s)",
+                    self.server_name, reason,
+                    rep_meta.get("score"), rep_meta.get("band"),
+                )
+                self.metrics["errors"] += 1
+                return self._error(
+                    f"Sampling refused for server '{self.server_name}' "
+                    f"by reputation gate: {reason}"
+                )
+        except ImportError:
+            # Reputation module not yet installed — fail-open (the
+            # upstream rate limit + Patch 5 env validation still apply).
+            pass
+        except Exception as exc:
+            logger.warning(
+                "Reputation gate raised on server '%s': %s — failing open",
+                self.server_name, exc,
+            )
+
         # Resolve model
         model = self._resolve_model(getattr(params, "modelPreferences", None))
 
