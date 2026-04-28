@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -52,8 +53,28 @@ _CONTEXT_INVISIBLE_CHARS = {
 }
 
 
+_POLICY_FILE_NAMES = ("HERMES.md", ".hermes.md", "SOUL.md")
+
+
+def _is_policy_filename(filename: str) -> bool:
+    """True if *filename* (basename or relative path) is a policy file."""
+    base = os.path.basename(filename) if filename else filename
+    return base in _POLICY_FILE_NAMES
+
+
 def _scan_context_content(content: str, filename: str, is_policy: bool = False) -> str:
-    """Scan context file content for injection. Returns sanitized content."""
+    """Scan context file content for injection. Returns sanitized content.
+
+    Policy files (HERMES.md / .hermes.md / SOUL.md) describe what NOT to do, so
+    they legitimately contain literal examples of forbidden patterns. For those,
+    threat-pattern hits are logged at CRITICAL level but the content is ALWAYS
+    returned intact — never blocked, never replaced. Rationale: AH must boot
+    with its policy intact ("better policy + alert" than "no policy = unbounded
+    behaviour"). See SMCP G4.
+
+    For non-policy files (AGENTS.md, CLAUDE.md, .cursorrules, etc.), threat
+    matches still produce a [BLOCKED: ...] sentinel (legacy Patch 6 behaviour).
+    """
     findings = []
 
     # Check invisible unicode
@@ -63,19 +84,97 @@ def _scan_context_content(content: str, filename: str, is_policy: bool = False) 
 
     # Check threat patterns
     for pattern, pid in _CONTEXT_THREAT_PATTERNS:
-        # Policy files (SOUL.md, HERMES.md) describe what NOT to do, so they
-        # legitimately contain literal examples of forbidden patterns. Skip the
-        # exfil/secret-read patterns for those files but keep injection ones.
-        if is_policy and pid in ("exfil_curl", "read_secrets"):
-            continue
         if re.search(pattern, content, re.IGNORECASE):
             findings.append(pid)
 
-    if findings:
-        logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
-        return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+    if not findings:
+        return content
 
-    return content
+    if is_policy:
+        # Policy file: log critical, increment counter, return content intact.
+        logger.critical(
+            "policy file %s contains threat-pattern hits: %s — content kept intact (G4)",
+            filename,
+            ", ".join(findings),
+        )
+        try:
+            _POLICY_SCAN_HITS.append((filename, tuple(findings)))
+        except Exception:  # never let bookkeeping break the boot
+            pass
+        return content
+
+    logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
+    return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
+
+
+# Visible from outside for diagnostics / startup check.
+_POLICY_SCAN_HITS: list = []
+
+
+class PolicyFilesMissingError(RuntimeError):
+    """Raised when a required policy file (HERMES.md / SOUL.md) cannot be loaded.
+
+    This is intentionally fatal: AH must refuse to start rather than run without
+    its policy in context. See SMCP guarantee G4.
+    """
+
+
+def _check_single_policy_file(label: str, path: Optional[Path]) -> Optional[str]:
+    """Return None if *path* is a usable policy file, else a short reason string."""
+    if path is None:
+        return f"{label} not found (searched HERMES_HOME and cwd→git-root walk)"
+    if not path.exists():
+        return f"{label} does not exist at {path}"
+    if not path.is_file():
+        return f"{label} at {path} is not a regular file"
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"{label} at {path} unreadable: {e!r}"
+    if not content.strip():
+        return f"{label} at {path} is empty or whitespace-only"
+    return None
+
+
+def verify_policy_files_or_die(cwd: Optional[str] = None) -> None:
+    """Abort process if any required policy file (HERMES.md, SOUL.md) is unloadable.
+
+    Required by SMCP G4: AH must never boot without its policy files. Failure
+    modes that abort: missing, unreadable, empty. Threat-pattern hits do NOT
+    abort here — those are handled by ``_scan_context_content`` which keeps the
+    content and logs CRITICAL.
+
+    On failure: logs CRITICAL, prints a clear message to stderr, exits 78
+    (EX_CONFIG). Callers that legitimately want to bypass (batch jobs, tests)
+    should not call this function.
+    """
+    cwd_path = Path(cwd or os.getcwd()).resolve()
+
+    soul_path = get_hermes_home() / "SOUL.md"
+    hermes_path = _find_hermes_md(cwd_path)
+
+    failures: list[str] = []
+    for label, path in (("SOUL.md", soul_path), ("HERMES.md", hermes_path)):
+        reason = _check_single_policy_file(label, path)
+        if reason:
+            failures.append(reason)
+
+    if not failures:
+        return
+
+    msg_lines = [
+        "REFUSE TO START: AH policy files are required (SMCP G4).",
+        f"  cwd: {cwd_path}",
+        f"  HERMES_HOME: {get_hermes_home()}",
+    ]
+    for reason in failures:
+        msg_lines.append(f"  - {reason}")
+    msg_lines.append("Restore the missing/empty policy file(s) and restart.")
+    msg = "\n".join(msg_lines)
+
+    logger.critical(msg)
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(78)  # EX_CONFIG
 
 
 def _find_git_root(start: Path) -> Optional[Path]:

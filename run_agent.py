@@ -892,6 +892,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        skip_policy_check: bool = False,
     ):
         """
         Initialize the AI Agent.
@@ -934,8 +935,18 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            skip_policy_check (bool): If True, bypass the SMCP G4 policy-files-required check at boot.
+                Production AH must NEVER set this. Reserved for batch_runner / tests where policy files
+                are not part of the run by design.
         """
         _install_safe_stdio()
+
+        # SMCP G4 — refuse to start without HERMES.md / SOUL.md loaded.
+        # Must run before any heavy init (transports, providers, etc.) so a
+        # missing policy file fails fast with a clear journalctl entry.
+        if not skip_policy_check:
+            from agent.prompt_builder import verify_policy_files_or_die
+            verify_policy_files_or_die()
 
         self.model = model
         self.max_iterations = max_iterations
