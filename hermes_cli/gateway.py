@@ -2336,9 +2336,17 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
                  hasn't fully exited yet.
     """
     sys.path.insert(0, str(PROJECT_ROOT))
-    
+
+    # SMCP G4 — refuse to start the gateway without HERMES.md / SOUL.md.
+    # AIAgent.__init__ already calls this defensively, but the gateway
+    # creates agents lazily (per-message), which would let a misconfigured
+    # boot run for hours before a missing-policy failure surfaces. Eager
+    # check here means systemd sees the failure within a second of boot.
+    from agent.prompt_builder import verify_policy_files_or_die
+    verify_policy_files_or_die()
+
     from gateway.run import start_gateway
-    
+
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
     print("├─────────────────────────────────────────────────────────┤")
