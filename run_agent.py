@@ -10031,47 +10031,35 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
-                    if _use_streaming:
-                        # ── SMCP G3 provenance gate (Patch 13) ─────────────────
-                        # Block if the trace contains untrusted sources without
-                        # user authorisation, or if tool depth exceeds MAX_DEPTH.
+                    # ── SMCP G3 provenance gate (Patch 13, fixed 2026-04-30) ───
+                    # Block if the trace contains untrusted sources without
+                    # user authorisation, or if tool depth exceeds MAX_DEPTH.
+                    # The check MUST be inside the try: previously it was outside
+                    # so the except branch was dead code and the block path
+                    # propagated an uncaught exception instead of returning the
+                    # structured [ProvenanceGate] error.
+                    try:
                         self._provenance_check_or_raise(api_kwargs)
-                        try:
+                        if _use_streaming:
                             response = self._interruptible_streaming_api_call(
                                 api_kwargs, on_first_delta=_stop_spinner
                             )
-                        except ProvenanceBlocked as e:
-                            _blocked_reason = str(e)
-                            self._vprint(
-                                f"{self.log_prefix}🛡️ Provenance gate blocked: {_blocked_reason}",
-                                force=True,
-                            )
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "messages": messages,
-                                "completed": False,
-                                "api_calls": api_call_count,
-                                "error": f"[ProvenanceGate] {_blocked_reason}",
-                                "failed": True,
-                            }
-                    else:
-                        self._provenance_check_or_raise(api_kwargs)
-                        try:
+                        else:
                             response = self._interruptible_api_call(api_kwargs)
-                        except ProvenanceBlocked as e:
-                            _blocked_reason = str(e)
-                            self._vprint(
-                                f"{self.log_prefix}🛡️ Provenance gate blocked: {_blocked_reason}",
-                                force=True,
-                            )
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "messages": messages,
-                                "completed": False,
-                                "api_calls": api_call_count,
-                                "error": f"[ProvenanceGate] {_blocked_reason}",
-                                "failed": True,
-                            }
+                    except ProvenanceBlocked as e:
+                        _blocked_reason = str(e)
+                        self._vprint(
+                            f"{self.log_prefix}🛡️ Provenance gate blocked: {_blocked_reason}",
+                            force=True,
+                        )
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": f"[ProvenanceGate] {_blocked_reason}",
+                            "failed": True,
+                        }
                     
                     api_duration = time.time() - api_start_time
                     
