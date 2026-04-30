@@ -292,5 +292,75 @@ def tag_file_read(content: str, path: str) -> Tag:
     return Tag(source=ProvenanceSource.FILE_READ, server_name=path)
 
 
+class ProvenanceBlocked(Exception):
+    """Raised when should_block_llm_call decides to deny an LLM call.
+
+    Carries the human-readable reason so the caller can surface it to the user.
+    """
+
+
 def tag_web_fetch(content: str, url: str) -> Tag:
     return Tag(source=ProvenanceSource.WEB_FETCH, server_name=url)
+
+
+def from_messages_api(api_messages: list[dict]) -> list[Message]:
+    """Reconstruct a provenance-tagged trace from an OpenAI-format messages list.
+
+    Maps OpenAI message roles to ProvenanceSource:
+      system → SYSTEM
+      user   → USER
+      assistant → ASSISTANT
+      tool   → MCP_TOOL  (tool result = untrusted input, like an MCP output)
+      developer → SYSTEM (Anthropic-specific, treat as system)
+
+    Call this with the pre-LLM-call api_messages to build a trace for
+    should_block_llm_call().
+    """
+    trace: list[Message] = []
+    for msg in api_messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            # Multi-modal or tool-call content — flatten to text for checksumming
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(part.get("text", ""))
+                else:
+                    parts.append(str(part))
+            content = " ".join(parts)
+        elif not isinstance(content, str):
+            content = str(content or "")
+
+        if role == "system":
+            tag = Tag(source=ProvenanceSource.SYSTEM)
+        elif role == "user":
+            tag = Tag(source=ProvenanceSource.USER)
+        elif role == "assistant":
+            tag = Tag(source=ProvenanceSource.ASSISTANT)
+        elif role == "tool":
+            # Tool results fed back into the context are treated as MCP_TOOL:
+            # they originate from an external tool/MCP execution and are
+            # therefore untrusted input for any subsequent LLM call.
+            tag = Tag(source=ProvenanceSource.MCP_TOOL)
+        elif role == "developer":
+            # Anthropic developer role — equivalent to system prompt
+            tag = Tag(source=ProvenanceSource.SYSTEM)
+        else:
+            tag = Tag(source=ProvenanceSource.UNKNOWN)
+
+        trace.append(Message(role=role, content=content, tag=tag))
+
+    return trace
+
+
+def intent_from_api_kwargs(api_kwargs: dict) -> str:
+    """Infer the LLM call intent from api_kwargs.
+
+    Returns 'tool' if tools are present in the schema (tool-call turn),
+    otherwise 'sampling' (plain conversation / reasoning).
+    """
+    tools = api_kwargs.get("tools") or api_kwargs.get("tool_choice")
+    if tools:
+        return "tool"
+    return "sampling"

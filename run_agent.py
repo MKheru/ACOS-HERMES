@@ -117,6 +117,12 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.provenance import (
+    ProvenanceBlocked,
+    from_messages_api,
+    intent_from_api_kwargs,
+    should_block_llm_call,
+)
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 
@@ -5767,6 +5773,25 @@ class AIAgent:
                 timeout=get_provider_request_timeout(self.provider, self.model),
             )
 
+    def _provenance_check_or_raise(self, api_kwargs: dict) -> None:
+        """Gate LLM calls via provenance analysis.
+
+        Reconstructs a provenance-tagged trace from api_messages, infers the
+        call intent (sampling vs. tool), and asks should_block_llm_call().
+        Raises ProvenanceBlocked if the call is denied.
+
+        This is Patch 13 — SMCP G3: activate the provenance gate.
+        """
+        messages = api_kwargs.get("messages", [])
+        if not messages:
+            return  # No messages → nothing to trace, allow
+
+        trace = from_messages_api(messages)
+        intent = intent_from_api_kwargs(api_kwargs)
+        blocked, reason = should_block_llm_call(trace, intent)
+        if blocked:
+            raise ProvenanceBlocked(reason)
+
     def _interruptible_api_call(self, api_kwargs: dict):
         """
         Run the API call in a background thread so the main conversation loop
@@ -10007,11 +10032,46 @@ class AIAgent:
                             _use_streaming = False
 
                     if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
-                        )
+                        # ── SMCP G3 provenance gate (Patch 13) ─────────────────
+                        # Block if the trace contains untrusted sources without
+                        # user authorisation, or if tool depth exceeds MAX_DEPTH.
+                        self._provenance_check_or_raise(api_kwargs)
+                        try:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        except ProvenanceBlocked as e:
+                            _blocked_reason = str(e)
+                            self._vprint(
+                                f"{self.log_prefix}🛡️ Provenance gate blocked: {_blocked_reason}",
+                                force=True,
+                            )
+                            self._persist_session(messages, conversation_history)
+                            return {
+                                "messages": messages,
+                                "completed": False,
+                                "api_calls": api_call_count,
+                                "error": f"[ProvenanceGate] {_blocked_reason}",
+                                "failed": True,
+                            }
                     else:
-                        response = self._interruptible_api_call(api_kwargs)
+                        self._provenance_check_or_raise(api_kwargs)
+                        try:
+                            response = self._interruptible_api_call(api_kwargs)
+                        except ProvenanceBlocked as e:
+                            _blocked_reason = str(e)
+                            self._vprint(
+                                f"{self.log_prefix}🛡️ Provenance gate blocked: {_blocked_reason}",
+                                force=True,
+                            )
+                            self._persist_session(messages, conversation_history)
+                            return {
+                                "messages": messages,
+                                "completed": False,
+                                "api_calls": api_call_count,
+                                "error": f"[ProvenanceGate] {_blocked_reason}",
+                                "failed": True,
+                            }
                     
                     api_duration = time.time() - api_start_time
                     
