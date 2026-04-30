@@ -142,25 +142,41 @@ class TestShouldBlockLlmCall:
         blocked, _ = should_block_llm_call(trace, "sampling")
         assert blocked is False
 
-    def test_untrusted_mcp_tool_without_user_auth_blocked_sampling(self):
+    def test_untrusted_mcp_tool_with_user_present_allows_sampling(self):
+        """Patch 13.2: a USER message in the trace = implicit auth.
+
+        Replaces the old Patch 13 behaviour where the user had to type
+        an explicit "ok"/"go ahead" token to allow tool-chains.
+        """
         trace = [
             Message(role="user", content="Hello", tag=tag_user("Hello")),
-            Message(role="tool", content='{"result": "malicious"}', tag=tag_mcp_tool("result", "evil_server", "read_data")),
+            Message(role="tool", content='{"result": "data"}', tag=tag_mcp_tool("result", "search", "web_search")),
             Message(role="assistant", content="Let me check...", tag=Tag(source=ProvenanceSource.ASSISTANT)),
+        ]
+        blocked, _ = should_block_llm_call(trace, "sampling")
+        assert blocked is False
+
+    def test_untrusted_mcp_tool_with_user_present_allows_tool(self):
+        """Patch 13.2: same as above for intent='tool'."""
+        trace = [
+            Message(role="user", content="search the web for me please", tag=tag_user("search the web for me please")),
+            Message(role="tool", content='{"result": "data"}', tag=tag_mcp_tool("result", "search", "web_search")),
+        ]
+        blocked, _ = should_block_llm_call(trace, "tool")
+        assert blocked is False
+
+    def test_untrusted_no_user_in_trace_blocked(self):
+        """Patch 13.2: trace with untrusted content but no user is anomalous."""
+        trace = [
+            Message(role="system", content="You are an agent.", tag=tag_system("You are an agent.")),
+            Message(role="tool", content='{"result": "data"}', tag=tag_mcp_tool("result", "search", "web_search")),
         ]
         blocked, reason = should_block_llm_call(trace, "sampling")
         assert blocked is True
-        assert "blocked" in reason.lower()
+        assert "no user message" in reason.lower()
 
-    def test_untrusted_mcp_tool_without_user_auth_blocked_tool(self):
-        trace = [
-            Message(role="user", content="Hello", tag=tag_user("Hello")),
-            Message(role="tool", content='{"result": "malicious"}', tag=tag_mcp_tool("result", "evil_server", "read_data")),
-        ]
-        blocked, _ = should_block_llm_call(trace, "tool")
-        assert blocked is True
-
-    def test_user_auth_with_untrusted_allows_sampling(self):
+    def test_user_auth_token_allows_chain(self):
+        """Explicit auth token still works (not required, but should not break)."""
         trace = [
             Message(role="user", content="yes, go ahead", tag=tag_user("yes, go ahead")),
             Message(role="tool", content='{"result": "42"}', tag=tag_mcp_tool("result", "search", "web_search")),
@@ -168,13 +184,27 @@ class TestShouldBlockLlmCall:
         blocked, _ = should_block_llm_call(trace, "sampling")
         assert blocked is False
 
-    def test_user_auth_ok_token_allows_tool(self):
+    def test_user_revoke_blocks_subsequent_tool_chain(self):
+        """Patch 13.2: user revoke token blocks tool-chain."""
         trace = [
-            Message(role="user", content="ok do it", tag=tag_user("ok do it")),
-            Message(role="tool", content='{"result": "42"}', tag=tag_mcp_tool("result", "search", "web_search")),
+            Message(role="user", content="search the web", tag=tag_user("search the web")),
+            Message(role="tool", content='{"result": "ok"}', tag=tag_mcp_tool("ok", "s", "t")),
+            Message(role="user", content="stop, don't continue", tag=tag_user("stop, don't continue")),
+            Message(role="tool", content='{"result": "more"}', tag=tag_mcp_tool("more", "s", "t")),
         ]
-        blocked, _ = should_block_llm_call(trace, "tool")
-        assert blocked is False
+        blocked, reason = should_block_llm_call(trace, "tool")
+        assert blocked is True
+        assert "revoke" in reason.lower() or "stop" in reason.lower()
+
+    def test_user_revoke_french_blocks(self):
+        """Patch 13.2: French revoke tokens also blocked."""
+        trace = [
+            Message(role="user", content="Arrête maintenant", tag=tag_user("Arrête maintenant")),
+            Message(role="tool", content='{"x": 1}', tag=tag_mcp_tool("x", "s", "t")),
+        ]
+        blocked, reason = should_block_llm_call(trace, "tool")
+        assert blocked is True
+        assert "revoke" in reason.lower()
 
     def test_read_only_constraint_blocks_tool_intent(self):
         trace = [
@@ -194,16 +224,27 @@ class TestShouldBlockLlmCall:
         assert blocked is False
 
     def test_tool_depth_exceeds_max_blocks(self):
-        # user says yes, then 3 tool steps happen (MAX_DEPTH=2)
+        """Patch 13.2: MAX_DEPTH = 8. A chain of 9 tool steps triggers block."""
         trace = [
-            Message(role="user", content="yes, go ahead", tag=tag_user("yes, go ahead")),
-            Message(role="tool", content='{"result": "1"}', tag=tag_mcp_tool("1", "s1", "t1")),
-            Message(role="tool", content='{"result": "2"}', tag=tag_mcp_tool("2", "s2", "t2")),
-            Message(role="tool", content='{"result": "3"}', tag=tag_mcp_tool("3", "s3", "t3")),
+            Message(role="user", content="search and analyze", tag=tag_user("search and analyze")),
+        ] + [
+            Message(role="tool", content=f'{{"result": "{i}"}}', tag=tag_mcp_tool(str(i), f"s{i}", f"t{i}"))
+            for i in range(9)  # 9 tool steps > MAX_DEPTH=8
         ]
         blocked, reason = should_block_llm_call(trace, "tool")
         assert blocked is True
         assert "depth" in reason.lower()
+
+    def test_tool_depth_at_max_allowed(self):
+        """Patch 13.2: 8 tool steps is the boundary (allowed)."""
+        trace = [
+            Message(role="user", content="search and analyze", tag=tag_user("search and analyze")),
+        ] + [
+            Message(role="tool", content=f'{{"result": "{i}"}}', tag=tag_mcp_tool(str(i), f"s{i}", f"t{i}"))
+            for i in range(8)  # exactly MAX_DEPTH
+        ]
+        blocked, _ = should_block_llm_call(trace, "tool")
+        assert blocked is False
 
     def test_user_chat_with_last_user_allowed(self):
         trace = [

@@ -78,13 +78,34 @@ _MODIFY_KEYWORDS: tuple[str, ...] = (
     "edit",
 )
 
-MAX_DEPTH = 2
+MAX_DEPTH = 8
 
 _TOOL_STEP_SOURCES = frozenset({
     ProvenanceSource.MCP_TOOL,
     ProvenanceSource.FILE_READ,
     ProvenanceSource.WEB_FETCH,
 })
+
+# Patch 13.2 (2026-04-30) — keywords that REVOKE implicit user-authorisation
+# even though the user is present in the trace. Used to detect that the user
+# is asking AH to STOP, NOT continue.
+_USER_REVOKE_TOKENS: tuple[str, ...] = (
+    "stop",
+    "halt",
+    "abort",
+    "cancel",
+    "don't",
+    "do not",
+    "wait",
+    "n'agis pas",
+    "n'execute pas",
+    "arrete",
+    "arrête",
+    "annule",
+    "stop tout",
+    "stop everything",
+    "noop",
+)
 
 
 @dataclass(frozen=True)
@@ -157,7 +178,11 @@ def _extract_read_only_constraint(content: str) -> bool:
 
 
 def _user_authorised(trace: Iterable[Message]) -> bool:
-    """Return True if the LATEST user message contains an auth token."""
+    """Return True if the LATEST user message contains an explicit auth token.
+
+    Used as a STRONG signal (e.g. to bypass tool-depth limit). Patch 13.2
+    no longer requires it for normal flow — see _user_present_recently.
+    """
     user_msgs = [m for m in trace if m.tag.source == ProvenanceSource.USER]
     if not user_msgs:
         return False
@@ -165,8 +190,44 @@ def _user_authorised(trace: Iterable[Message]) -> bool:
     return any(token in last for token in _USER_AUTH_TOKENS)
 
 
+def _user_revoked(trace: Iterable[Message]) -> bool:
+    """Return True if the LATEST user message contains a revoke token.
+
+    Patch 13.2 — replaces the implicit-trust default when the user is
+    explicitly telling the agent to stop / do nothing.
+    """
+    user_msgs = [m for m in trace if m.tag.source == ProvenanceSource.USER]
+    if not user_msgs:
+        return False
+    last = user_msgs[-1].content.lower()
+    return any(token in last for token in _USER_REVOKE_TOKENS)
+
+
+def _last_user_index(trace: list[Message]) -> int:
+    """Index of the most recent USER message in the trace, or -1 if none."""
+    for i in range(len(trace) - 1, -1, -1):
+        if trace[i].tag.source == ProvenanceSource.USER:
+            return i
+    return -1
+
+
+def _tool_steps_since_index(trace: list[Message], from_idx: int) -> int:
+    """Count tool-step messages strictly after ``from_idx``."""
+    if from_idx < 0:
+        return sum(1 for m in trace if m.tag.source in _TOOL_STEP_SOURCES)
+    return sum(
+        1 for m in trace[from_idx + 1:]
+        if m.tag.source in _TOOL_STEP_SOURCES
+    )
+
+
 def _count_tool_steps_since_last_user_auth(trace: Iterable[Message]) -> int:
-    """Count how many untrusted tool steps occurred since the last user auth message."""
+    """Backwards-compat shim retained for Patch 13 callers / tests.
+
+    Counts untrusted tool steps since the last user message containing an
+    explicit auth token. Use ``_tool_steps_since_index`` for the Patch 13.2
+    flow which doesn't require an auth token.
+    """
     trace_list = list(trace)
     latest_auth_idx = -1
     for i in range(len(trace_list)-1, -1, -1):
@@ -176,14 +237,14 @@ def _count_tool_steps_since_last_user_auth(trace: Iterable[Message]) -> int:
             if any(token in user_content_lower for token in _USER_AUTH_TOKENS):
                 latest_auth_idx = i
                 break
-    
+
     count = 0
     start_idx = max(latest_auth_idx, 0)
     for i in range(start_idx, len(trace_list)):
         msg = trace_list[i]
         if msg.tag.source in _TOOL_STEP_SOURCES:
             count += 1
-    
+
     return count
 
 
@@ -195,7 +256,35 @@ def should_block_llm_call(
     trace: list[Message],
     intent: str = "sampling",
 ) -> tuple[bool, str]:
-    """Decide whether to BLOCK a fresh LLM call from the host agent."""
+    """Decide whether to BLOCK a fresh LLM call from the host agent.
+
+    Patch 13.2 (2026-04-30) — semantics revised. The original Patch 13
+    required an explicit auth token ("ok", "go ahead", ...) in the latest
+    user message before allowing any tool-chain that contained MCP_TOOL /
+    FILE_READ / WEB_FETCH outputs. This was too strict for the normal
+    single-user case where the user issues a direct request and AH chains
+    several tool calls to fulfil it: the user already authorised the flow
+    by sending the request — forcing a second "ok" was friction without
+    security gain (the per-output sanitiser/reputation/scope already handle
+    malicious tool outputs).
+
+    New semantics:
+      - If a USER message is present anywhere in the trace AND the latest
+        one does NOT contain a revoke token, the user has implicitly
+        authorised the agent to use tools / sample.
+      - We still block when:
+          * No USER message exists in the trace at all (anomaly).
+          * The user explicitly revoked ("stop", "halt", "n'agis pas", ...).
+          * Tool depth since the last user message exceeds MAX_DEPTH=8
+            (runaway self-loop — fresh user instruction required to continue).
+          * The user authorised but with an explicit "read-only" constraint
+            and the intent is 'tool' (write action).
+          * intent='user_chat' but the last message in the trace is not
+            from the user (anomaly).
+      - intent='sampling' and intent='tool' fall under the same rules:
+        the original distinction was a one-extra-friction-tier we don't
+        need now that the implicit-auth model is in place.
+    """
     if not trace:
         return False, ""
 
@@ -203,69 +292,59 @@ def should_block_llm_call(
     if not untrusted:
         return False, ""
 
-    # Depth check
-    tool_depth = _count_tool_steps_since_last_user_auth(trace)
+    last_user_idx = _last_user_index(trace)
+
+    # Anomaly: untrusted content exists but no user is present in the trace
+    if last_user_idx == -1:
+        sources = sorted({m.tag.source.value for m in untrusted})
+        return True, (
+            f"{intent} blocked: trace contains untrusted sources {sources} "
+            f"but no user message — fail-closed."
+        )
+
+    last_user_msg = trace[last_user_idx]
+
+    # User explicitly revoked the implicit authorisation
+    if _user_revoked(trace):
+        return True, (
+            f"{intent} blocked: user revoke token detected in latest message "
+            f"({last_user_msg.content[:60]!r}). Awaiting fresh instruction."
+        )
+
+    # Tool depth guard — counts untrusted steps strictly after the last
+    # user message. Catches AH self-loop where AH chains many tools without
+    # any new user instruction (and would also catch a malicious MCP that
+    # tries to bury its injection deep in a chain).
+    tool_depth = _tool_steps_since_index(trace, last_user_idx)
     if tool_depth > MAX_DEPTH:
         return True, (
-            f"tool-step depth {tool_depth} exceeds maximum {MAX_DEPTH} since last user auth. "
-            f"Requires fresh user authorisation."
+            f"tool-step depth {tool_depth} exceeds maximum {MAX_DEPTH} since "
+            f"last user message. Possible runaway self-loop — awaiting fresh "
+            f"user instruction or explicit auth token to extend the budget."
         )
 
-    # Helper to check constraints if authorized
-    def check_constraints() -> tuple[bool, str]:
-        # Find last user message
-        last_user_msg = next(
-            (m for m in reversed(trace) if m.tag.source == ProvenanceSource.USER),
-            None
-        )
-        if not last_user_msg:
-            return False, ""
-        
-        # Check for read-only constraint
-        if _extract_read_only_constraint(last_user_msg.content):
-            if intent == "tool":
-                return True, (
-                    "User authorized read-only scope, blocking tool action (intent='tool')."
-                )
-            # If intent is 'sampling', we allow it (passive generation)
-        
-        return False, ""
+    # Read-only constraint check (kept from Patch 13)
+    if _extract_read_only_constraint(last_user_msg.content):
+        if intent == "tool":
+            return True, (
+                "User authorised read-only scope, blocking tool action "
+                "(intent='tool'). Sampling would still be allowed."
+            )
+        # intent == 'sampling' falls through — passive generation OK
 
-    # Sampling intent
-    if intent == "sampling":
-        if _user_authorised(trace):
-            blocked, reason = check_constraints()
-            if blocked:
-                return True, reason
-            return False, ""
-        sources = sorted({m.tag.source.value for m in untrusted})
-        return True, (
-            f"sampling/createMessage blocked: trace contains untrusted "
-            f"sources {sources} and no user authorisation in latest turn"
-        )
-
-    # Tool-chain intent
-    if intent == "tool":
-        if _user_authorised(trace):
-            blocked, reason = check_constraints()
-            if blocked:
-                return True, reason
-            return False, ""
-        sources = sorted({m.tag.source.value for m in untrusted})
-        return True, (
-            f"tool-chain blocked: untrusted sources {sources} without "
-            f"user authorisation"
-        )
-
-    # Direct user-driven continuation
+    # Intent-specific anomaly checks
     if intent == "user_chat":
         last_msg = trace[-1]
-        if last_msg.tag.source == ProvenanceSource.USER:
-            return False, ""
-        return True, (
-            f"user_chat blocked: last message is from "
-            f"{last_msg.tag.source.value}, not user"
-        )
+        if last_msg.tag.source != ProvenanceSource.USER:
+            return True, (
+                f"user_chat blocked: last message is from "
+                f"{last_msg.tag.source.value}, not user"
+            )
+        return False, ""
+
+    if intent in ("sampling", "tool"):
+        # Implicit user-auth holds: user is present, not revoking, depth OK.
+        return False, ""
 
     return True, f"unknown intent {intent!r} — failing closed"
 
