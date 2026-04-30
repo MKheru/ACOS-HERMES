@@ -246,6 +246,71 @@ class TestShouldBlockLlmCall:
         blocked, _ = should_block_llm_call(trace, "tool")
         assert blocked is False
 
+    # ─── Patch 13.3a — AFK mode ───────────────────────────────────────────────
+
+    def test_afk_mode_fr_raises_max_depth(self):
+        """Patch 13.3a: 'je vais me coucher' raises MAX_DEPTH to 50."""
+        trace = [
+            Message(role="user", content="Bonne nuit, je vais me coucher", tag=tag_user("Bonne nuit, je vais me coucher")),
+        ] + [
+            Message(role="tool", content=f'{{"r": "{i}"}}', tag=tag_mcp_tool(str(i), f"s{i}", f"t{i}"))
+            for i in range(40)  # > MAX_DEPTH=8 but < MAX_DEPTH_AFK=50
+        ]
+        blocked, _ = should_block_llm_call(trace, "tool")
+        assert blocked is False
+
+    def test_afk_mode_en_raises_max_depth(self):
+        """Patch 13.3a: 'good night' (EN) raises MAX_DEPTH."""
+        trace = [
+            Message(role="user", content="Good night, see you tomorrow", tag=tag_user("Good night, see you tomorrow")),
+        ] + [
+            Message(role="tool", content=f'{{"r": "{i}"}}', tag=tag_mcp_tool(str(i), f"s{i}", f"t{i}"))
+            for i in range(30)  # > MAX_DEPTH=8 but < MAX_DEPTH_AFK=50
+        ]
+        blocked, _ = should_block_llm_call(trace, "tool")
+        assert blocked is False
+
+    def test_afk_mode_still_caps_at_max_afk(self):
+        """Patch 13.3a: MAX_DEPTH_AFK=50 is still a hard limit even in AFK."""
+        trace = [
+            Message(role="user", content="je vais me coucher", tag=tag_user("je vais me coucher")),
+        ] + [
+            Message(role="tool", content=f'{{"r": "{i}"}}', tag=tag_mcp_tool(str(i), f"s{i}", f"t{i}"))
+            for i in range(51)  # > MAX_DEPTH_AFK=50
+        ]
+        blocked, reason = should_block_llm_call(trace, "tool")
+        assert blocked is True
+        assert "afk mode" in reason.lower()
+        assert "50" in reason
+
+    def test_afk_mode_revoke_takes_precedence(self):
+        """Patch 13.3a: revoke token in latest msg overrides AFK mode."""
+        trace = [
+            Message(role="user", content="je vais me coucher", tag=tag_user("je vais me coucher")),
+            Message(role="tool", content='{"r": "1"}', tag=tag_mcp_tool("1", "s", "t")),
+            Message(role="user", content="Arrête en fait, j'ai changé d'avis", tag=tag_user("Arrête en fait, j'ai changé d'avis")),
+            Message(role="tool", content='{"r": "2"}', tag=tag_mcp_tool("2", "s", "t")),
+        ]
+        blocked, reason = should_block_llm_call(trace, "tool")
+        assert blocked is True
+        assert "revoke" in reason.lower()
+
+    def test_afk_mode_normal_msg_keeps_normal_depth(self):
+        """Patch 13.3a: AFK detection requires the LATEST msg to contain
+        the trigger; an earlier AFK msg followed by a normal user msg
+        does NOT keep AFK mode active (intent might have changed)."""
+        trace = [
+            Message(role="user", content="je vais me coucher", tag=tag_user("je vais me coucher")),
+            Message(role="tool", content='{"r": "1"}', tag=tag_mcp_tool("1", "s", "t")),
+            Message(role="user", content="ok je suis revenu, fais X", tag=tag_user("ok je suis revenu, fais X")),
+        ] + [
+            Message(role="tool", content=f'{{"r": "{i}"}}', tag=tag_mcp_tool(str(i), f"s{i}", f"t{i}"))
+            for i in range(10)  # > MAX_DEPTH=8 (normal limit)
+        ]
+        blocked, reason = should_block_llm_call(trace, "tool")
+        assert blocked is True
+        assert "normal mode" in reason.lower()
+
     def test_user_chat_with_last_user_allowed(self):
         trace = [
             Message(role="user", content="Hello", tag=tag_user("Hello")),

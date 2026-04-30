@@ -79,6 +79,9 @@ _MODIFY_KEYWORDS: tuple[str, ...] = (
 )
 
 MAX_DEPTH = 8
+MAX_DEPTH_AFK = 50  # Patch 13.3a: when user is in AFK mode, allow long
+                    # autonomous tool chains (compile / test / lab / commit
+                    # cycles can easily exceed 8 steps).
 
 _TOOL_STEP_SOURCES = frozenset({
     ProvenanceSource.MCP_TOOL,
@@ -105,6 +108,46 @@ _USER_REVOKE_TOKENS: tuple[str, ...] = (
     "stop tout",
     "stop everything",
     "noop",
+)
+
+# Patch 13.3a (2026-04-30) — keywords that put AH into AFK manual mode.
+# In this mode, MAX_DEPTH is raised to MAX_DEPTH_AFK so AH can run long
+# autonomous tool chains (compile, test, lab, commit cycles) without
+# hitting the runaway-self-loop guard. The blacklist for external
+# publish actions (git push, gh pr create, etc.) is enforced at the tool
+# execution layer (tools/mcp_tool.py), not here — provenance.py only
+# raises the depth limit.
+_USER_AFK_TOKENS: tuple[str, ...] = (
+    # FR
+    "je vais me coucher",
+    "bonne nuit",
+    "à demain",
+    "a demain",
+    "je sors",
+    "je m'absente",
+    "je me deconnecte",
+    "je me déconnecte",
+    "afk",
+    "je vais bouffer",
+    "pause",
+    "je m'en vais",
+    "je pars",
+    "à plus",
+    "a plus",
+    # EN
+    "good night",
+    "good evening",
+    "i'm afk",
+    "i am afk",
+    "i'm away",
+    "i am away",
+    "i'm out",
+    "i am out",
+    "see you tomorrow",
+    "talk to you tomorrow",
+    "going to sleep",
+    "going offline",
+    "logging off",
 )
 
 
@@ -201,6 +244,27 @@ def _user_revoked(trace: Iterable[Message]) -> bool:
         return False
     last = user_msgs[-1].content.lower()
     return any(token in last for token in _USER_REVOKE_TOKENS)
+
+
+def is_afk_mode(trace: Iterable[Message]) -> bool:
+    """Patch 13.3a — return True if the LATEST user message contains an
+    AFK trigger phrase.
+
+    AFK mode raises MAX_DEPTH so AH can run long autonomous tool chains
+    (compile, test, lab, commit cycles). It does NOT bypass the revoke
+    check: if the user says "Arrête, je vais me coucher" the revoke
+    takes precedence and AH stops anyway.
+
+    The detection is per-call (no persistent state at this layer). The
+    persistent AFK state is managed by the gateway in Patch 13.3b
+    (~/.hermes/afk_state.json) and feeds back into the trace via the
+    last user message it represents.
+    """
+    user_msgs = [m for m in trace if m.tag.source == ProvenanceSource.USER]
+    if not user_msgs:
+        return False
+    last = user_msgs[-1].content.lower()
+    return any(token in last for token in _USER_AFK_TOKENS)
 
 
 def _last_user_index(trace: list[Message]) -> int:
@@ -315,12 +379,21 @@ def should_block_llm_call(
     # user message. Catches AH self-loop where AH chains many tools without
     # any new user instruction (and would also catch a malicious MCP that
     # tries to bury its injection deep in a chain).
+    #
+    # Patch 13.3a: in AFK mode, the user has explicitly delegated long
+    # autonomous work to AH (compile, test, lab, commit cycles), so the
+    # depth limit is raised from MAX_DEPTH=8 to MAX_DEPTH_AFK=50. The
+    # external-publish blacklist (git push, gh pr create, etc.) is
+    # enforced separately at the tool execution layer.
+    afk = is_afk_mode(trace)
+    effective_max_depth = MAX_DEPTH_AFK if afk else MAX_DEPTH
     tool_depth = _tool_steps_since_index(trace, last_user_idx)
-    if tool_depth > MAX_DEPTH:
+    if tool_depth > effective_max_depth:
+        mode_label = "AFK mode" if afk else "normal mode"
         return True, (
-            f"tool-step depth {tool_depth} exceeds maximum {MAX_DEPTH} since "
-            f"last user message. Possible runaway self-loop — awaiting fresh "
-            f"user instruction or explicit auth token to extend the budget."
+            f"tool-step depth {tool_depth} exceeds maximum {effective_max_depth} "
+            f"({mode_label}) since last user message. Possible runaway self-loop — "
+            f"awaiting fresh user instruction or explicit auth token to extend the budget."
         )
 
     # Read-only constraint check (kept from Patch 13)
