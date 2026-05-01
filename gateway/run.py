@@ -10992,32 +10992,46 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
         tick_count += 1
 
-        # Patch 13.3c: AFK auto-transition check. Runs every cron tick (60s).
-        # If 23:00 UTC (= 20:00 GMT-3) AND idle ≥ 30 min AND state is normal,
-        # flip to afk_auto and post a Discord notification on #acos-hermes.
+        # Patch 13.3c + 13.4: AFK auto-transition check + heartbeat 3-cycles.
+        # Both run every cron tick (60s). Each may emit a Discord notification.
+        def _post_afk_notif_to_discord(text: str) -> None:
+            if not (adapters and loop is not None):
+                return
+            _discord = next(
+                (a for a in adapters if getattr(a, "name", "") == "discord"),
+                None,
+            )
+            if _discord is None:
+                return
+            import os as _os
+            _channel_id = _os.environ.get("DISCORD_HERMES_CHANNEL_ID")
+            if not _channel_id:
+                return
+            try:
+                _fut = asyncio.run_coroutine_threadsafe(
+                    _discord.send(_channel_id, text), loop,
+                )
+                _fut.result(timeout=10)
+            except Exception as _e:
+                logger.debug("AFK Discord post failed: %s", _e)
+
+        # Patch 13.3c — auto-transition (20h GMT-3 + idle 30min)
         try:
             from agent.afk_scheduler import check_auto_transitions
             _afk_state, _afk_notif = check_auto_transitions()
-            if _afk_notif and adapters and loop is not None:
-                # Post the notification to the configured Discord channel via
-                # the registered Discord adapter (if present).
-                _discord = next(
-                    (a for a in adapters if getattr(a, "name", "") == "discord"),
-                    None,
-                )
-                if _discord is not None:
-                    import os as _os
-                    _channel_id = _os.environ.get("DISCORD_HERMES_CHANNEL_ID")
-                    if _channel_id:
-                        try:
-                            _fut = asyncio.run_coroutine_threadsafe(
-                                _discord.send(_channel_id, _afk_notif), loop,
-                            )
-                            _fut.result(timeout=10)
-                        except Exception as _e:
-                            logger.debug("AFK auto-notif post failed: %s", _e)
+            if _afk_notif:
+                _post_afk_notif_to_discord(_afk_notif)
         except Exception as e:
             logger.debug("AFK auto-transition check error: %s", e)
+
+        # Patch 13.4 — heartbeat 3-cycles (J3, J7, J14) + stand_by transition
+        try:
+            from agent.afk_heartbeat import evaluate_heartbeat
+            _hb_state, _hb_msg = evaluate_heartbeat()
+            if _hb_msg:
+                _post_afk_notif_to_discord(_hb_msg)
+        except Exception as e:
+            logger.debug("AFK heartbeat check error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
