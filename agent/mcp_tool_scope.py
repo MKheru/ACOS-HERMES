@@ -159,7 +159,16 @@ def user_message_authorises_chain(messages: list) -> bool:
 
 
 def enforce_tool_scope(tool_name: str, messages: list) -> Optional[str]:
-    """Decide whether the pending tool call is allowed under SMCP G2.
+    """Decide whether the pending tool call is allowed under SMCP G2 + AFK rules.
+
+    Patch 13.3b adds an AFK publish-blacklist check ahead of the G2 cross-MCP
+    enforcement. When AH is in AFK mode (manual or auto), a curated set of
+    "publish" tool names (git_push, gh_pr_create, gh_issue_create, slack /
+    telegram / email send, env-file writes, branch-protection edits) is
+    refused — those side effects must wait for explicit user review on
+    return. Local work (cargo build, cargo test, git commit, file edits in
+    the working tree, posts on the private #acos-hermes channel) remains
+    allowed.
 
     Args:
         tool_name: the name the LLM is invoking (e.g. ``mcp_filesystem_write``).
@@ -169,6 +178,40 @@ def enforce_tool_scope(tool_name: str, messages: list) -> Optional[str]:
         None if the call is allowed, otherwise a ``[BLOCKED: ...]`` refusal
         string suitable for use as the tool's response payload.
     """
+    # Patch 13.3b: AFK publish-blacklist hook (runs before G2 cross-MCP).
+    try:
+        from agent.afk_state import (
+            AFKState,
+            MODE_AFK_MANUAL,
+            check_publish_blocked_in_afk,
+            is_afk_from_messages,
+            load_state,
+        )
+        persistent_state = load_state()
+        # If the user JUST issued an AFK trigger in the latest message, treat
+        # the call as if persistent state were already AFK_MANUAL — covers
+        # the window between user trigger and the gateway tick that flips
+        # the persistent state file.
+        if not persistent_state.is_afk() and is_afk_from_messages(messages):
+            persistent_state = AFKState(mode=MODE_AFK_MANUAL)
+        afk_blocked, afk_reason = check_publish_blocked_in_afk(
+            tool_name, persistent_state,
+        )
+        if afk_blocked:
+            logger.warning(
+                "AFK publish-blacklist hit: %s — %s", tool_name, afk_reason,
+            )
+            return (
+                f"[BLOCKED: AFK publish guard. {afk_reason}. "
+                f"AH is currently in {persistent_state.mode}; this tool would "
+                f"externalise without user review and is deferred. "
+                f"Continue with local work (build, test, commit) and post a "
+                f"summary on #acos-hermes — Khéri will review on return.]"
+            )
+    except Exception as e:
+        # Fail open if AFK module is missing or borked — G2 still applies below.
+        logger.debug("AFK publish check skipped (%s); falling through to G2", e)
+
     tool_owner = get_owning_mcp(tool_name)
     if tool_owner is None:
         return None  # built-in, always allowed

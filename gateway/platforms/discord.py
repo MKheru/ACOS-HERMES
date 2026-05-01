@@ -60,6 +60,9 @@ from gateway.platforms.base import (
 )
 from tools.url_safety import is_safe_url
 
+# WS16: voice_io (local whisper.cpp + Piper TTS services)
+from tools.voice_io import is_native_voice_message, stt
+
 
 def _clean_discord_id(entry: str) -> str:
     """Strip common prefixes from a Discord user ID or username entry.
@@ -1092,6 +1095,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             content = sanitized_content
 
+            # WS16: if this chat just received a voice input, respond as a
+            # native voice message instead of plain text. Outbound-filter
+            # already sanitized the content, so the TTS gets the same string
+            # that would have gone out as text (G2 protection preserved).
+            effective_chat_id = thread_id if thread_id else chat_id
+            if self._consume_voice_response(effective_chat_id):
+                try:
+                    voice_result = await self.send_native_voice_message(
+                        effective_chat_id, content,
+                    )
+                    if voice_result.success:
+                        return voice_result
+                    logger.warning(
+                        "[Discord] voice response failed (%s); falling back to text",
+                        voice_result.error,
+                    )
+                except Exception as voice_err:
+                    logger.warning(
+                        "[Discord] voice response exception (%s); falling back to text",
+                        voice_err,
+                    )
+
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))
@@ -1450,6 +1475,130 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+
+    # ------------------------------------------------------------------
+    # WS16: Native voice message (TTS → Discord native voice message)
+    # ------------------------------------------------------------------
+    # Generates TTS via Piper, converts to OGG Opus, computes waveform,
+    # sends as a native Discord voice message (flags=8192).
+    # Usage: AH veut répondre en vocal → call this instead of send_voice.
+    # ------------------------------------------------------------------
+
+    async def send_native_voice_message(
+        self,
+        chat_id: str,
+        text: str,
+        voice: str = "fr_FR-upmc-medium",
+    ) -> SendResult:
+        """
+        Génère un vocal natif Discord depuis ``text`` via Piper TTS local.
+
+        Args:
+            chat_id: ID du salon Discord.
+            text: texte à synthétiser.
+            voice: voix Piper (défaut: féminine FR).
+
+        Returns:
+            SendResult avec success=True et message_id ou error.
+        """
+        # WS16 fix 2026-04-29: tts.service does WAV->Opus + waveform server-side
+        # via /synthesize-discord, so hermes-agent never spawns ffmpeg.
+        # hermes-agent.service runs under SECCOMP that kills child fork+exec
+        # of ffmpeg/ffprobe with SIGSYS — see /home/hermes/WS16_VOICE_STATUS.md.
+        from tools.voice_io import tts_discord, tts_health_check
+        import io
+
+        # 1. Vérifier que Piper est joignable
+        health = await tts_health_check()
+        if health.get("status") != "ok":
+            logger.warning("[Discord] Piper TTS service unavailable: %s", health)
+            return SendResult(
+                success=False,
+                error=f"Piper TTS service unavailable: {health.get('status')}",
+            )
+
+        # 2. Synthèse + WAV->Opus + waveform en un seul call HTTP (server-side, no subprocess)
+        try:
+            ogg_bytes, waveform_b64, duration = await tts_discord(text, voice=voice)
+        except Exception as tts_err:
+            logger.error("[Discord] tts_discord failed: %s", tts_err)
+            return SendResult(success=False, error=f"tts_discord failed: {tts_err}")
+
+        # 3. Envoyer via REST API (flags=8192)
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+
+            payload_json = json.dumps({
+                "flags": 8192,
+                "attachments": [{
+                    "id": "0",
+                    "filename": "voice-message.ogg",
+                    "content_type": "audio/ogg",
+                    "waveform": waveform_b64,
+                    "duration_secs": round(duration, 2),
+                }],
+            })
+            form = [
+                {"name": "payload_json", "value": payload_json},
+                {
+                    "name": "files[0]",
+                    "value": ogg_bytes,
+                    "filename": "voice-message.ogg",
+                    "content_type": "audio/ogg",
+                },
+            ]
+            msg_data = await self._client.http.request(
+                discord.http.Route(
+                    "POST",
+                    "/channels/{channel_id}/messages",
+                    channel_id=channel.id,
+                ),
+                form=form,
+            )
+            logger.info("[Discord] Native voice message sent: %s", msg_data.get("id"))
+            return SendResult(success=True, message_id=str(msg_data["id"]))
+        except Exception as send_err:
+            logger.error("[Discord] Failed to send native voice message: %s", send_err)
+            # Fallback: file attachment
+            try:
+                file = discord.File(io.BytesIO(ogg_bytes), filename="voice-message.ogg")
+                msg = await channel.send(file=file)
+                return SendResult(success=True, message_id=str(msg.id))
+            except Exception as fallback_err:
+                return SendResult(success=False, error=f"Fallback also failed: {fallback_err}")
+
+    # ------------------------------------------------------------------
+    # WS16 — auto voice-out when last input was voice (per chat, TTL'd)
+    # ------------------------------------------------------------------
+
+    def _mark_voice_input(self, chat_id: str) -> None:
+        """Mark a chat: the next outgoing message should be a native voice
+        message. State is per-chat (channel or thread) and TTL-bounded so a
+        slow LLM round-trip still gets voiced, but a stale flag from hours ago
+        won't.
+        """
+        import time
+        if not hasattr(self, "_voice_input_chats"):
+            self._voice_input_chats = {}
+        self._voice_input_chats[chat_id] = time.time()
+        # Bound the dict to ~50 chats (drop the oldest entry).
+        if len(self._voice_input_chats) > 50:
+            oldest = min(self._voice_input_chats, key=self._voice_input_chats.get)
+            self._voice_input_chats.pop(oldest, None)
+
+    def _consume_voice_response(self, chat_id: str) -> bool:
+        """Return True if a voice response is queued for this chat. Clears the
+        flag whether or not the TTL is still valid (single-shot)."""
+        import time
+        chats = getattr(self, "_voice_input_chats", None)
+        if not chats:
+            return False
+        ts = chats.pop(chat_id, None)
+        if ts is None:
+            return False
+        return (time.time() - ts) <= 600  # 10 min TTL
 
     # ------------------------------------------------------------------
     # Voice channel methods (join / leave / play)
@@ -3207,6 +3356,22 @@ class DiscordAdapter(BasePlatformAdapter):
         # can clobber message.content, breaking /command detection in channels.
         raw_content = message.content.strip()
         normalized_content = raw_content
+
+        # Patch 13.3c: AFK state-transition hook. Detects AFK triggers and
+        # revoke tokens in the user's message, persists to ~/.hermes/afk_state.json,
+        # and posts a confirmation in this channel when the mode flipped.
+        # Skipped for bot messages, system messages, and self-mentions.
+        if not message.author.bot and raw_content:
+            try:
+                from agent.afk_scheduler import process_user_message
+                _afk_state, _afk_confirm = process_user_message(raw_content)
+                if _afk_confirm:
+                    try:
+                        await message.channel.send(_afk_confirm)
+                    except Exception as _e:
+                        logger.debug("[Discord] failed to post AFK confirm: %s", _e)
+            except Exception as _e:
+                logger.debug("[Discord] AFK hook error (non-fatal): %s", _e)
         mention_prefix = False
         if self._client.user and self._client.user in message.mentions:
             mention_prefix = True
@@ -3416,10 +3581,59 @@ class DiscordAdapter(BasePlatformAdapter):
                                 except UnicodeDecodeError:
                                     pass
                         except Exception as e:
-                            logger.warning(
-                                "[Discord] Failed to cache document %s: %s",
-                                att.filename, e, exc_info=True,
-                            )
+                                logger.warning(
+                                    "[Discord] Failed to cache document %s: %s",
+                                    att.filename, e, exc_info=True,
+                                )
+
+        # ------------------------------------------------------------------
+        # WS16: Native Discord voice message → STT via local whisper service
+        # ------------------------------------------------------------------
+        # Native voice messages (flags & 8192) are audio attachments sent from
+        # the Discord mobile/desktop client with waveform UI.  We transcribe
+        # them via the local whisper.cpp service instead of using the
+        # generic transcription_tools (which routes to external APIs).
+        # This keeps Kheri's voice on-device (guarantee V2).
+        if media_urls and is_native_voice_message(message):
+            cached_audio = media_urls[-1]  # path written by _cache_discord_audio
+            stt_succeeded = False
+            try:
+                audio_bytes = open(cached_audio, "rb").read()
+                transcript = await stt(audio_bytes)
+                if transcript:
+                    voice_transcript = f"[Message vocal — transcription]: {transcript}"
+                    if pending_text_injection:
+                        pending_text_injection = f"{pending_text_injection}\n\n{voice_transcript}"
+                    else:
+                        pending_text_injection = voice_transcript
+                    print(f"[Discord] Voice STT: {transcript[:100]}", flush=True)
+                    stt_succeeded = True
+                    # WS16: mark this chat so the response goes back as a
+                    # native voice message (auto voice-in -> voice-out).
+                    self._mark_voice_input(str(message.channel.id))
+                else:
+                    print("[Discord] Voice STT returned empty transcript", flush=True)
+            except Exception as voice_stt_err:
+                print(f"[Discord] Voice STT failed: {voice_stt_err}", flush=True)
+
+            # WS16 fix 2026-04-29 23:15: drop the audio entry from media_urls
+            # so gateway/run.py does NOT re-transcribe it via tools/transcription_tools
+            # (which imports faster_whisper -> ctranslate2 -> mbind syscall ->
+            # SIGSYS under our SystemCallFilter=~@resources). The local whisper
+            # call above already produced the transcript. We drop the audio
+            # whether STT succeeded or not — falling back to faster_whisper
+            # would crash hermes-agent. If STT failed, AH receives the message
+            # without audio context, which is a graceful degradation vs crash.
+            if media_urls and media_urls[-1] == cached_audio:
+                media_urls.pop()
+                if media_types:
+                    media_types.pop()
+                if not stt_succeeded:
+                    print(
+                        "[Discord] dropped audio from media_urls "
+                        "(local STT failed; preventing crash on faster_whisper fallback)",
+                        flush=True,
+                    )
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
         # to detect /slash commands in channel messages.
