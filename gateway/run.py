@@ -10992,6 +10992,33 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
         tick_count += 1
 
+        # Patch 13.3c: AFK auto-transition check. Runs every cron tick (60s).
+        # If 23:00 UTC (= 20:00 GMT-3) AND idle ≥ 30 min AND state is normal,
+        # flip to afk_auto and post a Discord notification on #acos-hermes.
+        try:
+            from agent.afk_scheduler import check_auto_transitions
+            _afk_state, _afk_notif = check_auto_transitions()
+            if _afk_notif and adapters and loop is not None:
+                # Post the notification to the configured Discord channel via
+                # the registered Discord adapter (if present).
+                _discord = next(
+                    (a for a in adapters if getattr(a, "name", "") == "discord"),
+                    None,
+                )
+                if _discord is not None:
+                    import os as _os
+                    _channel_id = _os.environ.get("DISCORD_HERMES_CHANNEL_ID")
+                    if _channel_id:
+                        try:
+                            _fut = asyncio.run_coroutine_threadsafe(
+                                _discord.send(_channel_id, _afk_notif), loop,
+                            )
+                            _fut.result(timeout=10)
+                        except Exception as _e:
+                            logger.debug("AFK auto-notif post failed: %s", _e)
+        except Exception as e:
+            logger.debug("AFK auto-transition check error: %s", e)
+
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
                 from gateway.channel_directory import build_channel_directory
