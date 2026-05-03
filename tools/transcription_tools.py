@@ -26,12 +26,15 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -373,8 +376,76 @@ def _load_local_whisper_model(model_name: str):
         return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
+def _transcribe_via_whisper_service(file_path: str, endpoint: str, language: str = "") -> Dict[str, Any]:
+    """POST audio file to whisper.cpp HTTP server (whisper.service on the VPS).
+
+    The whisper.cpp server (port 8765 by default) exposes /inference accepting
+    OpenAI-compatible multipart form-data. We hit it via stdlib urllib so this
+    module gains no new pip dep and works under SECCOMP without subprocess.
+
+    Returns the same shape as _transcribe_local. On any failure (timeout,
+    non-200, malformed JSON), returns success=False with error — the caller
+    falls back to faster-whisper in-process.
+    """
+    try:
+        with open(file_path, "rb") as f:
+            audio_bytes = f.read()
+        boundary = f"----stt{os.urandom(8).hex()}"
+        filename = Path(file_path).name
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: audio/ogg\r\n\r\n"
+        ).encode("utf-8") + audio_bytes + (
+            f"\r\n--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="language"\r\n\r\n{language or "auto"}\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="response_format"\r\n\r\njson\r\n'
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        transcript = (data.get("text") or "").strip()
+        if not transcript:
+            return {"success": False, "transcript": "", "error": "empty transcript from whisper.service"}
+        logger.info(
+            "Transcribed %s via whisper.service HTTP (%s, %d chars)",
+            filename, endpoint, len(transcript),
+        )
+        return {"success": True, "transcript": transcript, "provider": "local_http"}
+    except urllib.error.URLError as e:
+        return {"success": False, "transcript": "", "error": f"whisper.service unreachable: {e.reason}"}
+    except Exception as e:
+        return {"success": False, "transcript": "", "error": f"whisper.service error: {e}"}
+
+
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
-    """Transcribe using faster-whisper (local, free)."""
+    """Transcribe locally: whisper.service HTTP first (large-v3-turbo if running),
+    then fallback to faster-whisper in-process (model from config)."""
+    # Phase 1: try whisper.service HTTP if endpoint is configured.
+    stt_cfg = _load_stt_config()
+    local_cfg = stt_cfg.get("local") or {}
+    endpoint = local_cfg.get("endpoint")
+    if endpoint:
+        result = _transcribe_via_whisper_service(
+            file_path,
+            endpoint,
+            language=local_cfg.get("language") or "",
+        )
+        if result.get("success"):
+            return result
+        logger.info(
+            "whisper.service HTTP failed (%s) — falling back to faster-whisper in-process",
+            result.get("error", "unknown"),
+        )
+
+    # Phase 2: faster-whisper in-process (legacy path, kept as fallback).
     global _local_model, _local_model_name
 
     if not _HAS_FASTER_WHISPER:
