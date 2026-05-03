@@ -10994,18 +10994,23 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
         # Patch 13.3c + 13.4: AFK auto-transition check + heartbeat 3-cycles.
         # Both run every cron tick (60s). Each may emit a Discord notification.
+        # adapters is Dict[Platform, BasePlatformAdapter] — must iterate values().
         def _post_afk_notif_to_discord(text: str) -> None:
-            if not (adapters and loop is not None):
+            if not adapters or loop is None:
+                logger.debug("AFK post skip: no adapters/loop")
                 return
+            _iter = adapters.values() if isinstance(adapters, dict) else adapters
             _discord = next(
-                (a for a in adapters if getattr(a, "name", "") == "discord"),
+                (a for a in _iter if getattr(a, "name", "").lower() == "discord"),
                 None,
             )
             if _discord is None:
+                logger.debug("AFK post skip: no discord adapter")
                 return
             import os as _os
             _channel_id = _os.environ.get("DISCORD_HERMES_CHANNEL_ID")
             if not _channel_id:
+                logger.debug("AFK post skip: DISCORD_HERMES_CHANNEL_ID empty")
                 return
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
@@ -11013,7 +11018,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 )
                 _fut.result(timeout=10)
             except Exception as _e:
-                logger.debug("AFK Discord post failed: %s", _e)
+                logger.warning("AFK Discord post failed: %s: %s", type(_e).__name__, _e)
 
         # Patch 13.3c — auto-transition (20h GMT-3 + idle 30min)
         try:

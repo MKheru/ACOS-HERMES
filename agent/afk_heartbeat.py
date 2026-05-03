@@ -37,6 +37,8 @@ from agent.afk_state import (
 logger = logging.getLogger(__name__)
 
 # Option B heartbeat schedule (Khéri's choice)
+
+
 HB_DAYS = (3, 7, 14)
 STAND_BY_DELAY_HOURS_AFTER_HB3 = 24
 
@@ -60,9 +62,12 @@ def _format_hb_message(hb_cycle: int, days_in_afk: int, state: AFKState) -> str:
         "• Pas de réponse — je continue selon mon jugement et je te ping au prochain heartbeat"
     )
 
+    intervals_str = ", ".join(f"J{int(d)}" if d == int(d) else f"J{d}" for d in HB_DAYS)
+
     if hb_cycle == 1:
         return (
-            f"💓 **Heartbeat 1/3 — J+{days_in_afk}** (option B intervals: J3, J7, J14).\n\n"
+            f"💓 **Heartbeat 1/{len(HB_DAYS)} — J+{days_in_afk}** "
+            f"(intervals: {intervals_str}).\n\n"
             f"Ça fait {days_in_afk} jours que tu es en AFK ({state.mode}). "
             f"J'espère que tu vas bien.\n\n"
             f"📊 État de mon travail (à compléter par AH lui-même au prochain "
@@ -72,7 +77,7 @@ def _format_hb_message(hb_cycle: int, days_in_afk: int, state: AFKState) -> str:
 
     if hb_cycle == 2:
         return (
-            f"💓 **Heartbeat 2/3 — J+{days_in_afk}**.\n\n"
+            f"💓 **Heartbeat 2/{len(HB_DAYS)} — J+{days_in_afk}**.\n\n"
             f"Toujours pas de nouvelles depuis le HB1. Je continue mon travail "
             f"selon les missions whitelist.\n\n"
             f"📊 Récap à voir dans ~/AFK_LOG.md (mis à jour par AH à chaque "
@@ -80,10 +85,12 @@ def _format_hb_message(hb_cycle: int, days_in_afk: int, state: AFKState) -> str:
         ) + common_tail
 
     if hb_cycle == 3:
+        sb_h = STAND_BY_DELAY_HOURS_AFTER_HB3
+        sb_str = f"{int(sb_h)}h" if sb_h == int(sb_h) else f"{sb_h}h"
         return (
-            f"💓 **Heartbeat 3/3 — J+{days_in_afk} — DERNIER PING**.\n\n"
+            f"💓 **Heartbeat {len(HB_DAYS)}/{len(HB_DAYS)} — J+{days_in_afk} — DERNIER PING**.\n\n"
             f"Khéri, ça fait {days_in_afk} jours sans nouvelles. Si tu ne réponds "
-            f"pas dans les **24h**, je passe en mode **stand_by** complet :\n"
+            f"pas dans les **{sb_str}**, je passe en mode **stand_by** complet :\n"
             f"• Plus de nouveaux commits / missions\n"
             f"• Lecture / monitoring uniquement\n"
             f"• Récap final posté ici\n\n"
