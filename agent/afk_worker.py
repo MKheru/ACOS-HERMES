@@ -285,6 +285,10 @@ class AFKWorker:
             "model": str(model_cfg.get("model", "")),
         }
 
+        # Verbose pre-delegation Discord post (default ON — see config.verbose)
+        if self._verbose(cfg):
+            self._post_discord_cycle_starting(task, model_cfg)
+
         # Run delegation (mutually-exclusive with itself)
         with self._delegation_lock:
             result = self._run_delegation(task, model_cfg)
@@ -299,6 +303,10 @@ class AFKWorker:
 
         # Quota delta after
         cycle.quota_after = self._read_quota()
+
+        # Verbose post-delegation Discord post (default ON)
+        if self._verbose(cfg):
+            self._post_discord_cycle_done(cycle)
 
         # Cycle status & cooldown reset / increment
         if cycle.delegation_status == "completed":
@@ -704,6 +712,70 @@ class AFKWorker:
             fut.result(timeout=15)
         except Exception:
             logger.exception("afk-worker: Discord post failed")
+
+    @staticmethod
+    def _verbose(cfg: dict) -> bool:
+        """Return True if afk_worker.verbose is enabled (default True).
+
+        When True, the worker posts 2 Discord messages per delegated cycle
+        (pre-delegation + post-delegation) on top of the existing
+        block/cooldown notifications. Set false for silent operation.
+        """
+        v = cfg.get("verbose")
+        if v is None:
+            return True
+        return bool(v)
+
+    def _post_discord_cycle_starting(self, task: TaskCandidate, model_cfg: dict) -> None:
+        toolsets = model_cfg.get("toolsets") or ["file", "todo"]
+        provider = model_cfg.get("provider", "?")
+        model = model_cfg.get("model", "?")
+        # Truncate long titles so Discord doesn't fail on > 2000 chars
+        title = task.title if len(task.title) <= 200 else (task.title[:197] + "...")
+        self._post_discord(
+            f"🔄 **AFK cycle starting**\n"
+            f"• Tâche : `{title}`\n"
+            f"• Source : `{task.source_file}` ({task.section}, l.{task.line_number})\n"
+            f"• Type AFK : `{task.afk_type}` | Priority : `{task.priority}`\n"
+            f"• Modèle : `{provider} / {model}`\n"
+            f"• Toolsets : {', '.join(f'`{t}`' for t in toolsets)}\n"
+            f"⏱ Délégation lancée — `delegation.child_timeout_seconds` = 600s max."
+        )
+
+    def _post_discord_cycle_done(self, cycle: CycleResult) -> None:
+        status = cycle.delegation_status or "unknown"
+        emoji = "✅" if status == "completed" else ("❌" if status == "error" else "⚠️")
+        title = (cycle.task.title if cycle.task else "?")
+        if len(title) > 200:
+            title = title[:197] + "..."
+        # Build a result block — summary truncated to ~500 chars (already
+        # capped at cycle build time, but defensive here too).
+        summary = cycle.delegation_summary or "(no summary)"
+        if len(summary) > 500:
+            summary = summary[:497] + "..."
+        duration = cycle.delegation_duration_s
+        duration_str = f"{duration:.1f}s" if isinstance(duration, (int, float)) else "?"
+        api_calls = cycle.delegation_api_calls if cycle.delegation_api_calls is not None else "?"
+
+        msg = (
+            f"{emoji} **AFK cycle done — `{status}`**\n"
+            f"• Tâche : `{title}`\n"
+            f"• API calls : {api_calls} | Duration : {duration_str}\n"
+        )
+        if cycle.delegation_error:
+            msg += f"• Error : `{cycle.delegation_error}`\n"
+        if status == "completed" and summary != "(no summary)":
+            msg += f"\n**Résumé sub-agent :**\n> {summary.replace(chr(10), chr(10) + '> ')}\n"
+        # Quota delta info
+        qa = cycle.quota_after or {}
+        if qa.get("minimax_5h_pct") is not None or qa.get("minimax_weekly_pct") is not None:
+            msg += (
+                f"\n📊 Quota MiniMax : "
+                f"{qa.get('minimax_5h_pct', '?')}% (5h) / "
+                f"{qa.get('minimax_weekly_pct', '?')}% (semaine)"
+            )
+        msg += f"\n_(détails : `~/AFK_LOG.md`)_"
+        self._post_discord(msg)
 
     def _post_discord_block(self, task: TaskCandidate) -> None:
         self._post_discord(

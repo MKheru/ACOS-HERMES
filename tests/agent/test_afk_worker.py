@@ -490,7 +490,7 @@ class TestTickFullCycle:
             encoding="utf-8",
         )
         w = _make_worker(tmp_path, monkeypatch)
-        cfg = _cfg(tmp_path, status_files=[str(f)])
+        cfg = _cfg(tmp_path, status_files=[str(f)], verbose=False)  # silent for log assert
         # Stub the parent_agent getter and delegate_task
         install_parent_agent_getter(lambda: object())
         fake_payload = json.dumps({
@@ -520,6 +520,82 @@ class TestTickFullCycle:
         )
         # Cleanup
         install_parent_agent_getter(None)
+
+
+class TestVerbosity:
+    def test_verbose_default_true(self):
+        assert AFKWorker._verbose({}) is True
+
+    def test_verbose_explicit_false(self):
+        assert AFKWorker._verbose({"verbose": False}) is False
+
+    def test_verbose_explicit_true(self):
+        assert AFKWorker._verbose({"verbose": True}) is True
+
+    def test_verbose_posts_two_messages_on_completed(self, tmp_path, monkeypatch):
+        _afk_state_file(tmp_path, monkeypatch, mode=MODE_AFK_AUTO)
+        f = tmp_path / "S.md"
+        f.write_text(
+            "## S\n- [ ] My task [priority:P1] [afk:code_review]\n",
+            encoding="utf-8",
+        )
+        w = _make_worker(tmp_path, monkeypatch)
+        cfg = _cfg(tmp_path, status_files=[str(f)], verbose=True)
+        install_parent_agent_getter(lambda: object())
+        fake_payload = json.dumps({
+            "results": [{
+                "status": "completed", "summary": "got it done",
+                "api_calls": 7, "duration_seconds": 42.0,
+            }]
+        })
+        with patch.object(w, "_read_quota", return_value={
+            "minimax_5h_pct": 1.0, "minimax_weekly_pct": 0.5,
+        }), patch.object(w, "_post_discord") as post_mock, \
+             patch("tools.delegate_tool.delegate_task", return_value=fake_payload):
+            w._tick(cfg)
+        # Two posts: cycle starting + cycle done
+        assert post_mock.call_count == 2
+        msg_pre = post_mock.call_args_list[0][0][0]
+        msg_post = post_mock.call_args_list[1][0][0]
+        assert "AFK cycle starting" in msg_pre
+        assert "My task" in msg_pre
+        assert "anthropic/claude-sonnet-4.6" in msg_pre
+        assert "AFK cycle done" in msg_post
+        assert "completed" in msg_post
+        assert "got it done" in msg_post
+        install_parent_agent_getter(None)
+
+    def test_verbose_false_silent_on_completed(self, tmp_path, monkeypatch):
+        _afk_state_file(tmp_path, monkeypatch, mode=MODE_AFK_AUTO)
+        f = tmp_path / "S.md"
+        f.write_text(
+            "## S\n- [ ] X [priority:P0] [afk:research]\n", encoding="utf-8",
+        )
+        w = _make_worker(tmp_path, monkeypatch)
+        cfg = _cfg(tmp_path, status_files=[str(f)], verbose=False)
+        install_parent_agent_getter(lambda: object())
+        fake_payload = json.dumps({
+            "results": [{"status": "completed", "summary": "ok",
+                          "api_calls": 1, "duration_seconds": 1.0}]
+        })
+        with patch.object(w, "_read_quota", return_value={
+            "minimax_5h_pct": 1.0, "minimax_weekly_pct": 0.5,
+        }), patch.object(w, "_post_discord") as post_mock, \
+             patch("tools.delegate_tool.delegate_task", return_value=fake_payload):
+            w._tick(cfg)
+        post_mock.assert_not_called()
+        install_parent_agent_getter(None)
+
+    def test_verbose_skip_no_task_silent(self, tmp_path, monkeypatch):
+        # skipped_no_task should be silent regardless of verbose flag
+        _afk_state_file(tmp_path, monkeypatch, mode=MODE_AFK_AUTO)
+        w = _make_worker(tmp_path, monkeypatch)
+        cfg = _cfg(tmp_path, status_files=[], verbose=True)
+        with patch.object(w, "_read_quota", return_value={
+            "minimax_5h_pct": 1.0, "minimax_weekly_pct": 0.5,
+        }), patch.object(w, "_post_discord") as post_mock:
+            w._tick(cfg)
+        post_mock.assert_not_called()
 
 
 # ═══ §11.4 security ═══════════════════════════════════════════════════════
