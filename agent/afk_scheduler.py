@@ -36,10 +36,28 @@ from agent.afk_state import (
 
 logger = logging.getLogger(__name__)
 
-# Auto-AFK trigger window: 20:00 GMT-3 = 23:00 UTC.
-# Configurable via afk_auto_trigger_hour_utc env-style override later.
-AFK_AUTO_TRIGGER_HOUR_UTC = 23  # 20:00 GMT-3
+# Auto-AFK trigger window: defaults match historical behaviour (20:00-20:59 GMT-3
+# = 23:00-23:59 UTC). Override via config.yaml afk.auto_trigger_start_utc /
+# auto_trigger_end_utc to widen for night-shift workers (e.g. 0/8 = 21h-5h Cayenne).
+AFK_AUTO_TRIGGER_HOUR_UTC = 23  # 20:00 GMT-3 (default start)
 IDLE_THRESHOLD_MINUTES = 30
+
+
+def _get_auto_trigger_window() -> tuple[int, int]:
+    """Read auto-AFK trigger window from config. Returns (start_h_utc, end_h_utc).
+
+    end is exclusive. If end <= start, the window wraps midnight
+    (e.g. start=22, end=6 means hours 22, 23, 0, 1, 2, 3, 4, 5).
+    Defaults to (23, 24) = 20:00-20:59 GMT-3 to match Patch 13.3c behaviour.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config().get("afk", {}) or {}
+        start = int(cfg.get("auto_trigger_start_utc", AFK_AUTO_TRIGGER_HOUR_UTC))
+        end = int(cfg.get("auto_trigger_end_utc", AFK_AUTO_TRIGGER_HOUR_UTC + 1))
+    except Exception:
+        return AFK_AUTO_TRIGGER_HOUR_UTC, AFK_AUTO_TRIGGER_HOUR_UTC + 1
+    return max(0, min(23, start)), max(1, min(24, end))
 
 
 # ---------------------------------------------------------------------------
@@ -99,21 +117,29 @@ def process_user_message(content: str, now_utc: Optional[datetime] = None) -> tu
             "💤 Bonne nuit Khéri. Je continue selon ta direction."
         )
 
-    # 3. Auto-AFK exit: any user msg flips state back to normal (option C
-    # default per Khéri's spec — option A "termine la tâche en cours puis
-    # répond" is signalled separately by the agent runtime, this hook
-    # only updates persistent state).
-    elif state.mode == MODE_AFK_AUTO and not has_afk_trigger and not has_revoke:
+    # 3. Active conversation while AFK → user is back. Exits BOTH afk_auto
+    # AND afk_manual (any non-trigger non-revoke message means the user is
+    # actively engaging — they're clearly not AFK anymore). Fixes the bug
+    # where afk_manual stayed sticky for 36h after a single trigger phrase.
+    elif state.is_afk() and not has_afk_trigger and not has_revoke:
+        prev_mode = state.mode
         state.mode = MODE_NORMAL
         state.entered_at = None
         state.heartbeats_sent = 0
         state.cooldown_level = 0
-        confirm = (
-            "👋 Je vois que tu es de retour. Je sors du mode AFK auto et "
-            "reprends le mode normal. Je termine la tâche en cours puis "
-            "je te réponds — dis-moi `stop` si tu veux que j'interrompe "
-            "tout maintenant."
-        )
+        if prev_mode == MODE_AFK_AUTO:
+            confirm = (
+                "👋 Je vois que tu es de retour. Je sors du mode AFK auto et "
+                "reprends le mode normal. Je termine la tâche en cours puis "
+                "je te réponds — dis-moi `stop` si tu veux que j'interrompe "
+                "tout maintenant."
+            )
+        else:  # MODE_AFK_MANUAL
+            confirm = (
+                "👋 Je vois que tu m'écris activement. Je sors du mode AFK "
+                "manuel et reprends le mode normal. Si tu veux rester silencieux, "
+                "redis explicitement `je vais dormir` ou un trigger AFK."
+            )
 
     # Persist if anything changed (mode flip OR last_user_msg_at update).
     save_state(state)
@@ -140,9 +166,16 @@ def check_auto_transitions(now_utc: Optional[datetime] = None) -> tuple[AFKState
     if state.mode != MODE_NORMAL:
         return state, None
 
-    # Time-of-day trigger: 20:00 GMT-3 == 23:00 UTC. Allow a 1-hour window
-    # (23:00-23:59 UTC) so the cron tick that lands at 23:01 still triggers.
-    if now_utc.hour != AFK_AUTO_TRIGGER_HOUR_UTC:
+    # Time-of-day trigger: configurable UTC window. Defaults to (23, 24) =
+    # 20:00-20:59 GMT-3 for backward compat. Configure via config.yaml
+    # afk.auto_trigger_start_utc / auto_trigger_end_utc.
+    start_h, end_h = _get_auto_trigger_window()
+    hour = now_utc.hour
+    if start_h < end_h:
+        in_window = start_h <= hour < end_h
+    else:  # window wraps midnight (e.g. 22-6)
+        in_window = hour >= start_h or hour < end_h
+    if not in_window:
         return state, None
 
     # Idle check: last_user_msg_at older than IDLE_THRESHOLD_MINUTES.
@@ -167,13 +200,17 @@ def check_auto_transitions(now_utc: Optional[datetime] = None) -> tuple[AFKState
         "AFK auto triggered at %s (idle %.1f min)",
         now_utc.isoformat(), idle_minutes,
     )
+    # Build heartbeat schedule string dynamically from HB_DAYS so any test
+    # override (e.g. accelerated cycles) is reflected in user-visible text.
+    from agent.afk_heartbeat import HB_DAYS as _HB_DAYS
+    _hb_str = ", ".join(f"J{int(d)}" if d == int(d) else f"J{d}" for d in _HB_DAYS)
     notification = (
-        "🌙 **Mode AFK auto activé** (20:00 GMT-3 + idle ≥ 30 min).\n"
-        "• MAX_DEPTH levé à 50, publish externe désactivé\n"
-        "• Je vais chercher des tâches in_progress dans ~/SMCP_STATUS.md, "
-        "~/WS*_STATUS.md, ~/acos/docs/ROADMAP.md\n"
-        "• Je te ping en heartbeat à J+3, J+7, J+14 (option B)\n"
-        "• Tu peux annuler à tout moment avec `stop` / `arrête` / nouveau msg\n\n"
-        "💤 Bonne soirée Khéri."
+        f"🌙 **Mode AFK auto activé** (window {start_h:02d}h-{end_h:02d}h UTC + idle ≥ {IDLE_THRESHOLD_MINUTES} min).\n"
+        f"• MAX_DEPTH levé à 50, publish externe désactivé\n"
+        f"• Je vais chercher des tâches in_progress dans ~/SMCP_STATUS.md, "
+        f"~/WS*_STATUS.md, ~/acos/docs/ROADMAP.md\n"
+        f"• Je te ping en heartbeat à {_hb_str} (option B)\n"
+        f"• Tu peux annuler à tout moment avec `stop` / `arrête` / nouveau msg\n\n"
+        f"💤 Bonne soirée Khéri."
     )
     return state, notification
