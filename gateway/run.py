@@ -11358,19 +11358,68 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # so shutdown is coordinated.
     from agent.afk_worker import AFKWorker, install_parent_agent_getter
 
+    # Cache the transient AFK-worker agent so we don't pay the build cost
+    # on every tick. Built lazily on first need; reused across ticks.
+    # Lives for the duration of the gateway process.
+    _afk_agent_cache: dict = {"agent": None}
+
     def _get_afk_parent_agent():
-        """Pick the most-recently-started running agent for the AFK worker
-        to use as parent_agent in delegate_task. Returns None if no agent
-        is currently active (worker logs and skips that tick)."""
+        """Resolve a parent_agent suitable for delegate_task in the AFK worker.
+
+        Strategy:
+          1. If a Discord/session agent is currently active, reuse it (free).
+          2. Otherwise build a transient AIAgent dedicated to the worker
+             (same pattern cron/scheduler.py uses for its jobs). This is
+             needed because the gateway is typically idle when the worker
+             ticks — _running_agents is empty until a user message arrives.
+          3. Cache the transient agent so subsequent ticks reuse it.
+
+        Returns None on credential resolution failure — the worker logs
+        the cycle as 'error' and retries next tick.
+        """
+        # Strategy 1: active session agent (most-recent)
         agents = getattr(runner, "_running_agents", None) or {}
-        if not agents:
+        if agents:
+            ts = getattr(runner, "_running_agents_ts", {}) or {}
+            if ts:
+                latest = max(ts, key=ts.get)
+                if latest in agents:
+                    return agents[latest]
+            return next(iter(agents.values()), None)
+
+        # Strategy 2: cached transient agent
+        if _afk_agent_cache["agent"] is not None:
+            return _afk_agent_cache["agent"]
+
+        # Strategy 3: build a fresh transient agent
+        try:
+            from run_agent import AIAgent
+            runtime = _resolve_runtime_agent_kwargs()
+            gateway_model = _resolve_gateway_model()
+            agent = AIAgent(
+                model=gateway_model,
+                api_key=runtime.get("api_key"),
+                base_url=runtime.get("base_url"),
+                provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                acp_command=runtime.get("command"),
+                acp_args=runtime.get("args"),
+                credential_pool=runtime.get("credential_pool"),
+                quiet_mode=True,
+                # No SOUL.md / AGENTS.md context injected (the delegated
+                # child gets its own context per delegate_task design).
+                skip_context_files=True,
+                # Don't let worker delegations corrupt user memory.
+                skip_memory=True,
+                platform="afk_worker",
+                session_id="afk_worker_persistent",
+            )
+            _afk_agent_cache["agent"] = agent
+            logger.info("afk-worker: built transient parent_agent for delegations")
+            return agent
+        except Exception:
+            logger.exception("afk-worker: cannot build transient parent_agent")
             return None
-        ts = getattr(runner, "_running_agents_ts", {}) or {}
-        if ts:
-            latest = max(ts, key=ts.get)
-            if latest in agents:
-                return agents[latest]
-        return next(iter(agents.values()), None)
 
     install_parent_agent_getter(_get_afk_parent_agent)
 
