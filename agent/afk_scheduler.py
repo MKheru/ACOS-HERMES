@@ -144,6 +144,16 @@ def process_user_message(content: str, now_utc: Optional[datetime] = None) -> tu
     # Persist if anything changed (mode flip OR last_user_msg_at update).
     save_state(state)
 
+    # WS-AUTO-002 OQ4 — purge the AFK worker picked-index whenever AH flips
+    # back to normal. This guarantees the next AFK starts with a clean slate
+    # (no stale "already completed" entries from a previous session).
+    if state.mode != old_mode and state.mode == MODE_NORMAL:
+        try:
+            from agent.afk_worker import purge_picked_index
+            purge_picked_index()
+        except Exception:
+            logger.debug("afk-worker picked-index purge failed", exc_info=True)
+
     if state.mode != old_mode:
         logger.info("AFK state: %s -> %s (user msg: %r)", old_mode, state.mode, content[:80])
 

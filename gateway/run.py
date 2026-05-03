@@ -11350,7 +11350,42 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="cron-ticker",
     )
     cron_thread.start()
-    
+
+    # WS-AUTO-002 — AFK Work Loop background thread.
+    # Independent from the cron ticker so a long delegation cycle (up to
+    # delegation.child_timeout_seconds = 600) can never block the 60s
+    # heartbeat / auto-AFK transition checks. Shares the same stop_event
+    # so shutdown is coordinated.
+    from agent.afk_worker import AFKWorker, install_parent_agent_getter
+
+    def _get_afk_parent_agent():
+        """Pick the most-recently-started running agent for the AFK worker
+        to use as parent_agent in delegate_task. Returns None if no agent
+        is currently active (worker logs and skips that tick)."""
+        agents = getattr(runner, "_running_agents", None) or {}
+        if not agents:
+            return None
+        ts = getattr(runner, "_running_agents_ts", {}) or {}
+        if ts:
+            latest = max(ts, key=ts.get)
+            if latest in agents:
+                return agents[latest]
+        return next(iter(agents.values()), None)
+
+    install_parent_agent_getter(_get_afk_parent_agent)
+
+    afk_worker = AFKWorker(
+        stop_event=cron_stop,
+        adapters=runner.adapters,
+        loop=asyncio.get_running_loop(),
+    )
+    afk_worker_thread = threading.Thread(
+        target=afk_worker.run,
+        daemon=True,
+        name="afk-worker",
+    )
+    afk_worker_thread.start()
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
@@ -11359,9 +11394,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
     
-    # Stop cron ticker cleanly
+    # Stop cron ticker + AFK worker cleanly (they share cron_stop).
     cron_stop.set()
     cron_thread.join(timeout=5)
+    afk_worker_thread.join(timeout=10)
 
     # Close MCP server connections
     try:

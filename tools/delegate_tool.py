@@ -1799,6 +1799,12 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     parent_agent=None,
+    # WS-AUTO-002 — per-call provider/model overrides for the AFK worker.
+    # All optional; None = preserve config-resolved credentials.
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
+    base_url_override: Optional[str] = None,
+    api_key_override: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -1811,6 +1817,12 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    Per-call credential overrides (`model_override`, `provider_override`,
+    `base_url_override`, `api_key_override`) let in-process callers — like
+    the AFK worker — route a single delegation to a different provider/
+    model without mutating ~/.hermes/config.yaml. Any unset override
+    leaves the config-resolved value in place.
 
     Returns JSON with results array, one entry per task.
     """
@@ -1870,6 +1882,18 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # WS-AUTO-002 — apply per-call overrides on top of config-resolved
+    # creds. Each override is independent; unset (None) overrides leave
+    # the corresponding config value untouched.
+    if model_override:
+        creds["model"] = model_override
+    if provider_override:
+        creds["provider"] = provider_override
+    if base_url_override:
+        creds["base_url"] = base_url_override
+    if api_key_override:
+        creds["api_key"] = api_key_override
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
