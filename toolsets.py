@@ -45,7 +45,7 @@ _HERMES_CORE_TOOLS = [
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
-    "text_to_speech",
+    "text_to_speech", "minimax_quota",
     # Planning & memory
     "todo", "memory",
     # Session history search
@@ -153,7 +153,7 @@ TOOLSETS = {
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
-        "tools": ["text_to_speech"],
+        "tools": ["text_to_speech", "minimax_quota"],
         "includes": []
     },
     
