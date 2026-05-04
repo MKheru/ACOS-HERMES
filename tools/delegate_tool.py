@@ -1840,6 +1840,17 @@ def delegate_task(
 
     Returns JSON with results array, one entry per task.
     """
+    # Bug 1 debug — unconditional entry log to confirm this code path runs
+    # and the new override params are received. Length-only on api_key.
+    logger.info(
+        "delegate_task ENTRY: goal_set=%s tasks_set=%s role=%s | "
+        "model_override=%r provider_override=%r base_url_override=%r "
+        "api_key_override_len=%d",
+        bool(goal), bool(tasks), role,
+        model_override, provider_override, base_url_override,
+        len(api_key_override or "") if api_key_override else 0,
+    )
+
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
