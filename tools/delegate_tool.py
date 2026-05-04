@@ -2215,6 +2215,17 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         elif "api.kimi.com/coding" in base_lower:
             provider = "custom"
             api_mode = "anthropic_messages"
+        elif (
+            base_url_hostname(configured_base_url)
+            in ("api.minimax.io", "api.minimaxi.com")
+            and "/anthropic" in base_lower
+        ):
+            # MiniMax exposes an Anthropic-compatible endpoint at /anthropic.
+            # Without this branch, sub-agents fall back to provider=custom +
+            # api_mode=chat_completions and POST to /v1/chat/completions →
+            # HTTP 404 because that path doesn't exist on MiniMax.
+            provider = "minimax"
+            api_mode = "anthropic_messages"
 
         return {
             "model": configured_model,
