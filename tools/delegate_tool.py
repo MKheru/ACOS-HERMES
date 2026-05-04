@@ -985,6 +985,20 @@ def _build_child_agent(
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
     effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
+
+    # Bug 1 debug — log what _build_child_agent will instantiate the child
+    # with. Compare against parent values to spot drift. Length-only on keys.
+    if any((override_provider, override_base_url, override_api_key)):
+        logger.info(
+            "_build_child_agent effective creds: model=%s provider=%s "
+            "base_url=%s api_key_len=%d api_mode=%s | "
+            "parent_provider=%s parent_base_url=%s parent_key_len=%d",
+            effective_model, effective_provider, effective_base_url,
+            len(effective_api_key or ""), effective_api_mode,
+            getattr(parent_agent, "provider", None),
+            getattr(parent_agent, "base_url", None),
+            len(parent_api_key or ""),
+        )
     effective_acp_command = override_acp_command or getattr(
         parent_agent, "acp_command", None
     )
@@ -1894,6 +1908,20 @@ def delegate_task(
         creds["base_url"] = base_url_override
     if api_key_override:
         creds["api_key"] = api_key_override
+
+    # Bug 1 debug — log resolved creds AFTER overrides applied. Length-only
+    # for api_key (never the value, §1).
+    if any((model_override, provider_override, base_url_override, api_key_override)):
+        _ck = creds.get("api_key") or ""
+        logger.info(
+            "delegate_task creds (post-override): provider=%s model=%s "
+            "base_url=%s api_mode=%s api_key_len=%d",
+            creds.get("provider"),
+            creds.get("model"),
+            creds.get("base_url"),
+            creds.get("api_mode"),
+            len(_ck),
+        )
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()

@@ -536,6 +536,19 @@ class AFKWorker:
         # OQ3 — toolsets from matrix; fallback to safe minimal
         toolsets = model_cfg.get("toolsets") or ["file", "todo"]
 
+        # WS-AUTO-002 Bug 1 debug — trace what we're about to pass to
+        # delegate_task. Logs key length only, never the value (§1).
+        logger.info(
+            "afk-worker delegation overrides: provider=%s model=%s "
+            "base_url=%s api_key_env=%r api_key_len=%d toolsets=%s",
+            model_cfg.get("provider"),
+            model_cfg.get("model"),
+            model_cfg.get("base_url"),
+            api_key_env_name,
+            len(api_key) if api_key else 0,
+            toolsets,
+        )
+
         try:
             result_str = delegate_task(
                 goal=goal,
@@ -602,10 +615,28 @@ class AFKWorker:
                 "duration_seconds": 0.0,
             }
         r = results[0]
+        status = r.get("status")
+        summary = r.get("summary") or ""
+        error = r.get("error")
+
+        # Bug 2 fix — delegate_task returns status=completed even when the
+        # child agent's LLM call exhausted retries without ever responding.
+        # Detect the pattern in the summary and promote to status=error so
+        # the picked-index marks the task for retry instead of "done".
+        if status == "completed" and summary.lstrip().lower().startswith(
+            "api call failed"
+        ):
+            logger.warning(
+                "afk-worker: child reports completed but summary indicates "
+                "API failure; promoting to status=error"
+            )
+            status = "error"
+            error = error or summary.strip().splitlines()[0]
+
         return {
-            "status": r.get("status"),
-            "summary": r.get("summary"),
-            "error": r.get("error"),
+            "status": status,
+            "summary": summary or None,
+            "error": error,
             "api_calls": r.get("api_calls", 0),
             "duration_seconds": r.get("duration_seconds", 0.0),
         }

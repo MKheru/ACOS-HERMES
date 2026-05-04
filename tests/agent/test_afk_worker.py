@@ -586,6 +586,41 @@ class TestVerbosity:
         post_mock.assert_not_called()
         install_parent_agent_getter(None)
 
+    def test_completed_with_api_fail_promoted_to_error(self, tmp_path, monkeypatch):
+        """Bug 2 — when delegate_task returns status=completed but the summary
+        starts with 'API call failed', the worker must override to error."""
+        _afk_state_file(tmp_path, monkeypatch, mode=MODE_AFK_AUTO)
+        f = tmp_path / "S.md"
+        f.write_text(
+            "## S\n- [ ] X [priority:P0] [afk:code_review]\n", encoding="utf-8",
+        )
+        w = _make_worker(tmp_path, monkeypatch)
+        cfg = _cfg(tmp_path, status_files=[str(f)], verbose=False)
+        install_parent_agent_getter(lambda: object())
+        # Simulate the exact failure pattern observed in prod
+        fake_payload = json.dumps({
+            "results": [{
+                "status": "completed",
+                "summary": "API call failed after 3 retries: ",
+                "api_calls": 1, "duration_seconds": 8.7,
+            }]
+        })
+        with patch.object(w, "_read_quota", return_value={
+            "minimax_5h_pct": 1.0, "minimax_weekly_pct": 0.5,
+        }), patch("tools.delegate_tool.delegate_task", return_value=fake_payload):
+            w._tick(cfg)
+        # Cycle status should be 'error', NOT 'completed'
+        obj = json.loads(
+            Path(cfg["log_jsonl_path"]).read_text(encoding="utf-8").splitlines()[0]
+        )
+        assert obj["status"] == "error"
+        # Picked-index should record last_cycle_status=error so it's retried
+        idx = json.loads(Path(cfg["picked_index_path"]).read_text(encoding="utf-8"))
+        entry = next(iter(idx.values()))
+        assert entry["last_cycle_status"] == "error"
+        assert entry["error_skips_remaining"] > 0
+        install_parent_agent_getter(None)
+
     def test_verbose_skip_no_task_silent(self, tmp_path, monkeypatch):
         # skipped_no_task should be silent regardless of verbose flag
         _afk_state_file(tmp_path, monkeypatch, mode=MODE_AFK_AUTO)
