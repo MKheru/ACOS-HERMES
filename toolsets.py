@@ -60,6 +60,11 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # ACOS local HTTP wrappers (gemini, acos-runner, acos-builder on 127.0.0.1).
+    # Registered in tools/local_runners.py with toolset="terminal"; the names
+    # must appear here too because TOOLSETS["terminal"]["tools"] is the
+    # source of truth resolved by hermes-cli, not the registry's toolset tag.
+    "gemini_call", "acos_runner_call", "acos_builder_call",
 ]
 
 
@@ -92,8 +97,8 @@ TOOLSETS = {
     },
     
     "terminal": {
-        "description": "Terminal/command execution and process management tools",
-        "tools": ["terminal", "process"],
+        "description": "Terminal/command execution + ACOS HTTP wrappers (gemini, acos-runner, acos-builder on 127.0.0.1)",
+        "tools": ["terminal", "process", "gemini_call", "acos_runner_call", "acos_builder_call"],
         "includes": []
     },
     
